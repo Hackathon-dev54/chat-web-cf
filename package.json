@@ -4,8 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev -p 3000 -H 0.0.0.0",
-    "build": "node scripts/sync-worker.js",
-    "deploy": "wrangler deploy",
+    "build": "next build",
     "start": "next start -p 3000 -H 0.0.0.0",
     "lint": "tsc --noEmit"
   },

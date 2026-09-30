@@ -1,5 +1,10 @@
 /**
+ * [COMMENTED OUT / INACTIVE - RUNNING AS STANDARD NEXT.JS WEB APP]
+ * 
  * Chatze Nepal Edition - Unified Federated Edge Messaging Web App
+ * This file is preserved for reference, but currently bypassed so the codebase
+ * builds and runs as a 100% standard Next.js web application.
+ */
  * 
  * Implements SYSTEM_DESIGN_CLOUDFLARE_ZERO_SETUP.md & system-design-vercel.md:
  * - 100% Free-Forever, Zero-Setup, One-Click Deploy on Cloudflare Workers + Native D1 Database
