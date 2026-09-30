@@ -4,8 +4,6 @@ import {
   Search,
   MessageSquare,
   ShieldCheck,
-  Zap,
-  Check,
   CheckCheck,
   LogOut,
   Bell,
@@ -19,9 +17,6 @@ import {
   Share2,
   Copy,
   AlertCircle,
-  MoreVertical,
-  Paperclip,
-  Smile,
 } from 'lucide-react'
 
 interface Conversation {
@@ -91,7 +86,6 @@ export function MessagingApp({
 
   // Stream state
   const [streamConnected, setStreamConnected] = useState(false)
-  const [pingMs, setPingMs] = useState(12)
   const [lastStreamActivity, setLastStreamActivity] = useState(Date.now())
 
   // Scroll states
@@ -143,7 +137,6 @@ export function MessagingApp({
         const data = await res.json()
         if (data.messages) {
           setMessages(data.messages)
-          scrollToBottom('instant')
         }
       }
     } catch (err) {
@@ -161,6 +154,18 @@ export function MessagingApp({
       loadMessages(activeConv.id)
     }
   }, [activeConv?.id])
+
+  // Periodic 3-second sync across Cloudflare Worker isolates
+  useEffect(() => {
+    const syncInterval = setInterval(() => {
+      loadConversations()
+      loadFriendships()
+      if (activeConvRef.current && activeConvRef.current.status !== 'pending') {
+        loadMessages(activeConvRef.current.id)
+      }
+    }, 3000)
+    return () => clearInterval(syncInterval)
+  }, [])
 
   const handleScroll = () => {
     const el = messagesContainerRef.current
@@ -192,7 +197,6 @@ export function MessagingApp({
         evtSource.addEventListener('connected', () => {
           setStreamConnected(true)
           setLastStreamActivity(Date.now())
-          setPingMs(Math.floor(Math.random() * 8) + 8)
         })
 
         evtSource.addEventListener('ping', () => {
@@ -277,7 +281,7 @@ export function MessagingApp({
     }
   }, [currentUser.id])
 
-  // Send Contact Connection Request
+  // Send Contact Connection Request (Passes accurate origin & handle)
   const handleSendFriendRequest = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!friendHandle.trim() || !friendDomain.trim()) return
@@ -293,6 +297,9 @@ export function MessagingApp({
           remoteHandle: friendHandle.trim(),
           remoteInstanceUrl: friendDomain.trim(),
           senderId: currentUser.id,
+          myHandle: currentUser.handle,
+          myDisplayName: currentUser.display_name,
+          myInstanceUrl: window.location.origin,
         }),
       })
       const data = await res.json()
@@ -331,7 +338,11 @@ export function MessagingApp({
       const res = await fetch('/api/federation/requests/accept', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ remoteHandle, remoteInstanceUrl }),
+        body: JSON.stringify({
+          remoteHandle,
+          remoteInstanceUrl,
+          myHandle: currentUser.handle,
+        }),
       })
       if (res.ok) {
         await loadFriendships()
@@ -391,6 +402,7 @@ export function MessagingApp({
           tempId,
           remoteInstanceUrl: activeConv.remoteInstanceUrl,
           remoteHandle: activeConv.otherUser.username,
+          myHandle: currentUser.handle,
         }),
       })
       const data = await res.json()
@@ -666,13 +678,10 @@ export function MessagingApp({
                   <p>2. Once accepted, real-time messaging unlocks instantly on both devices in <strong>0ms</strong>.</p>
                 </div>
 
-                {/* Simulation button for testing on single machine */}
-                <button
-                  onClick={() => handleAcceptFriendRequest(activeConv.otherUser.username, activeConv.remoteInstanceUrl || '')}
-                  className="px-4 py-2 bg-[#202c33] hover:bg-[#222e35] border border-[#222e35] rounded-xl text-xs text-[#00a884] font-semibold transition-all cursor-pointer"
-                >
-                  (Testing Simulation) Approve Connection Now
-                </button>
+                <div className="flex items-center justify-center gap-2 text-xs text-amber-400/90 font-medium bg-amber-500/10 border border-amber-500/20 py-2.5 px-4 rounded-xl w-full">
+                  <Clock className="w-4 h-4 animate-spin text-amber-400" />
+                  <span>Waiting for @{activeConv.otherUser.username} to accept your request...</span>
+                </div>
               </div>
             ) : (
               <div
@@ -832,7 +841,7 @@ export function MessagingApp({
                     required
                     value={friendHandle}
                     onChange={(e) => setFriendHandle(e.target.value)}
-                    placeholder="e.g. alice or yogesh"
+                    placeholder="e.g. suraj or alice"
                     className="w-full pl-8 pr-3.5 py-2.5 bg-[#202c33] border border-[#222e35] rounded-xl text-sm text-[#e9edef] focus:outline-none focus:border-[#00a884]"
                   />
                 </div>
@@ -847,12 +856,12 @@ export function MessagingApp({
                     required
                     value={friendDomain}
                     onChange={(e) => setFriendDomain(e.target.value)}
-                    placeholder="e.g. alice.workers.dev or custom.domain"
+                    placeholder="e.g. chat-web-cfopou.askme50962.workers.dev"
                     className="w-full pl-10 pr-3.5 py-2.5 bg-[#202c33] border border-[#222e35] rounded-xl text-sm text-[#e9edef] focus:outline-none focus:border-[#00a884]"
                   />
                 </div>
                 <p className="text-[10px] text-[#8696a0] pl-1">
-                  Their Cloudflare Workers domain (e.g. user.workers.dev)
+                  Their Cloudflare Workers domain (e.g. username.workers.dev)
                 </p>
               </div>
 
@@ -919,7 +928,7 @@ export function MessagingApp({
               }}
               className="w-full py-2.5 bg-[#00a884] hover:bg-[#02906f] text-[#111b21] font-bold rounded-xl text-xs flex items-center justify-center gap-2 cursor-pointer transition-all"
             >
-              {copiedLink ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+              {copiedLink ? <CheckCheck className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
               {copiedLink ? 'Copied to Clipboard!' : 'Copy Connection Details'}
             </button>
           </div>

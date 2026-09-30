@@ -28,7 +28,7 @@ type UserStreamClient = {
   write: (data: string) => void
 }
 
-const activeStreams = new Map<string, Set<UserStreamClient>>() // userId -> Set of open devices
+const activeStreams = new Map<string, Set<UserStreamClient>>()
 
 export function emitUserEvent(userId: string, eventName: string, payload: any) {
   const clients = activeStreams.get(userId)
@@ -199,7 +199,6 @@ async function ensureD1Database(db: any) {
       try {
         await db.prepare(stmt).run()
       } catch (stmtErr: any) {
-        // Continue if already exists or non-fatal
         console.warn('[D1 stmt warning]', stmtErr?.message)
       }
     }
@@ -209,7 +208,7 @@ async function ensureD1Database(db: any) {
   }
 }
 
-// Normalize URL helper
+// Normalize URL helper (Ensures https:// and removes trailing slash)
 function normalizeUrl(url: string): string {
   let cleaned = (url || '').trim()
   if (!cleaned.startsWith('http://') && !cleaned.startsWith('https://')) {
@@ -442,7 +441,8 @@ app.get('/api/federation/friendships', async (c) => {
 // ============================================================================
 app.post('/api/federation/requests', async (c) => {
   try {
-    const { remoteHandle, remoteInstanceUrl, senderId } = await c.req.json()
+    const body = await c.req.json()
+    const { remoteHandle, remoteInstanceUrl, senderId, myHandle, myDisplayName, myInstanceUrl } = body
     const cleanRemoteHandle = (remoteHandle || '').replace(/^@/, '').trim().toLowerCase()
     const normalizedUrl = normalizeUrl(remoteInstanceUrl)
     const localUserId = senderId || 'usr_admin'
@@ -450,6 +450,26 @@ app.post('/api/federation/requests', async (c) => {
     const friendshipId = 'freq_' + Math.random().toString(36).slice(2, 9)
     const conversationId = 'conv_' + cleanRemoteHandle
     const now = Date.now()
+
+    // Resolve sender identity cleanly from request or D1
+    let actualHandle = myHandle || ''
+    let actualDisplayName = myDisplayName || ''
+    const db = c.env?.DB
+
+    if (db && (!actualHandle || !actualDisplayName)) {
+      try {
+        await ensureD1Database(db)
+        const adminRow: any = await db.prepare("SELECT handle, display_name FROM users WHERE role = 'admin' LIMIT 1").first()
+        if (adminRow) {
+          actualHandle = actualHandle || adminRow.handle
+          actualDisplayName = actualDisplayName || adminRow.display_name
+        }
+      } catch (e) {}
+    }
+    actualHandle = actualHandle || memoryStore.users.get(localUserId)?.handle || 'user'
+    actualDisplayName = actualDisplayName || memoryStore.config.get('display_name') || 'Chatze User'
+
+    const originUrl = myInstanceUrl || c.req.url.replace(/\/api\/.*$/, '')
 
     const friendshipRecord: MemFriendship = {
       id: friendshipId,
@@ -475,7 +495,6 @@ app.post('/api/federation/requests', async (c) => {
     memoryStore.friendships.set(friendshipId, friendshipRecord)
     memoryStore.conversations.set(conversationId, convRecord)
 
-    const db = c.env?.DB
     if (db) {
       try {
         await ensureD1Database(db)
@@ -489,15 +508,10 @@ app.post('/api/federation/requests', async (c) => {
       }
     }
 
-    // Non-blocking dispatch to peer instance
-    const myHandle = memoryStore.users.get(localUserId)?.handle || 'me'
-    const myName = memoryStore.config.get('display_name') || 'Chatze User'
-    const myInstanceUrl = c.req.url.replace(/\/api\/.*$/, '')
-
     const payload = JSON.stringify({
-      from_handle: myHandle,
-      from_display_name: myName,
-      from_instance_url: myInstanceUrl,
+      from_handle: actualHandle,
+      from_display_name: actualDisplayName,
+      from_instance_url: originUrl,
       to_handle: cleanRemoteHandle,
       timestamp: now,
     })
@@ -509,21 +523,28 @@ app.post('/api/federation/requests', async (c) => {
       console.warn('[Sign Error]', e)
     }
 
-    fetch(`${normalizedUrl}/api/federation/v1/requests`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Federation-Signature': signature,
-      },
-      body: payload,
-    }).catch((err) => {
-      console.warn('[Federation Dispatch Warning: Remote peer offline]', err?.message)
-    })
+    // Await fetch so Cloudflare Workers edge runtime does not cancel it!
+    let remoteSuccess = false
+    try {
+      const remoteRes = await fetch(`${normalizedUrl}/api/federation/v1/requests`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Federation-Signature': signature,
+        },
+        body: payload,
+      })
+      remoteSuccess = remoteRes.ok
+      console.log('[Remote Peer Request Result]', remoteRes.status)
+    } catch (remoteErr: any) {
+      console.warn('[Remote Peer Request Offline/Failed]', remoteErr?.message)
+    }
 
     emitUserEvent(localUserId, 'conversation_updated', convRecord)
 
     return c.json({
       success: true,
+      remoteDelivered: remoteSuccess,
       friendship: friendshipRecord,
       conversation: convRecord,
     })
@@ -600,7 +621,7 @@ app.post('/api/federation/v1/requests', async (c) => {
 // ============================================================================
 app.post('/api/federation/requests/accept', async (c) => {
   try {
-    const { remoteHandle, remoteInstanceUrl } = await c.req.json()
+    const { remoteHandle, remoteInstanceUrl, myHandle } = await c.req.json()
     const cleanHandle = (remoteHandle || '').replace(/^@/, '').trim().toLowerCase()
     const conversationId = 'conv_' + cleanHandle
     const now = Date.now()
@@ -615,15 +636,21 @@ app.post('/api/federation/requests/accept', async (c) => {
     }
 
     const db = c.env?.DB
+    let actualMyHandle = myHandle || ''
     if (db) {
       try {
         await ensureD1Database(db)
         await db.prepare("UPDATE federation_friendships SET status = 'active' WHERE remote_handle = ?").bind(cleanHandle).run()
         await db.prepare("UPDATE conversations SET status = 'active', last_message_snippet = 'Connected! You can now message each other.' WHERE id = ?").bind(conversationId).run()
+        if (!actualMyHandle) {
+          const adminRow: any = await db.prepare("SELECT handle FROM users WHERE role = 'admin' LIMIT 1").first()
+          if (adminRow) actualMyHandle = adminRow.handle
+        }
       } catch (d1Err: any) {
         console.warn('[D1 Accept Warning]', d1Err?.message)
       }
     }
+    actualMyHandle = actualMyHandle || 'me'
 
     // Live unlock on local screen
     broadcastAllStreams('friend_accepted', {
@@ -632,20 +659,21 @@ app.post('/api/federation/requests/accept', async (c) => {
       status: 'active',
     })
 
-    // Forward acceptance to peer instance
+    // Forward acceptance to peer instance with AWAIT so Cloudflare Workers delivers it
     if (remoteInstanceUrl) {
-      const myHandle = memoryStore.users.get('usr_admin')?.handle || 'me'
-      fetch(`${normalizeUrl(remoteInstanceUrl)}/api/federation/v1/requests/accept`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          from_handle: myHandle,
-          accepted: true,
-          timestamp: now,
-        }),
-      }).catch((err) => {
+      try {
+        await fetch(`${normalizeUrl(remoteInstanceUrl)}/api/federation/v1/requests/accept`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            from_handle: actualMyHandle,
+            accepted: true,
+            timestamp: now,
+          }),
+        })
+      } catch (err: any) {
         console.warn('[Accept Dispatch Warning]', err?.message)
-      })
+      }
     }
 
     return c.json({ success: true, unlocked: true })
@@ -768,7 +796,7 @@ app.get('/api/messaging', async (c) => {
 
 app.post('/api/messaging', async (c) => {
   try {
-    const { conversationId, body, senderId, tempId, remoteInstanceUrl, remoteHandle } = await c.req.json()
+    const { conversationId, body, senderId, tempId, remoteInstanceUrl, remoteHandle, myHandle } = await c.req.json()
     const messageId = 'msg_' + Math.random().toString(36).slice(2, 9)
     const now = Date.now()
     const actualSender = senderId || 'usr_admin'
@@ -814,25 +842,34 @@ app.post('/api/messaging', async (c) => {
     emitUserEvent(actualSender, 'new_message', messageRecord)
     broadcastAllStreams('new_message', messageRecord)
 
-    // Forward to peer instance if remote
+    // Forward to peer instance if remote with AWAIT so Cloudflare Workers does not terminate it
     const targetUrl = remoteInstanceUrl || memoryStore.conversations.get(conversationId)?.remote_instance_url
     if (targetUrl) {
-      const myHandle = memoryStore.users.get(actualSender)?.handle || 'me'
+      let senderHandle = myHandle || ''
+      if (db && !senderHandle) {
+        try {
+          const adminRow: any = await db.prepare("SELECT handle FROM users WHERE role = 'admin' LIMIT 1").first()
+          if (adminRow) senderHandle = adminRow.handle
+        } catch (e) {}
+      }
+      senderHandle = senderHandle || memoryStore.users.get(actualSender)?.handle || 'me'
       const targetHandle = remoteHandle || memoryStore.conversations.get(conversationId)?.remote_handle
 
-      fetch(`${normalizeUrl(targetUrl)}/api/federation/v1/messages`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sender_handle: myHandle,
-          recipient_handle: targetHandle,
-          body: messageRecord.body,
-          conversation_id: 'conv_' + myHandle,
-          timestamp: now,
-        }),
-      }).catch((err) => {
+      try {
+        await fetch(`${normalizeUrl(targetUrl)}/api/federation/v1/messages`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sender_handle: senderHandle,
+            recipient_handle: targetHandle,
+            body: messageRecord.body,
+            conversation_id: 'conv_' + senderHandle,
+            timestamp: now,
+          }),
+        })
+      } catch (err: any) {
         console.warn('[Remote Forward Warning]', err?.message)
-      })
+      }
     }
 
     return c.json({ success: true, message: messageRecord }, 201)
