@@ -4,6 +4,7 @@ import { streamSSE } from 'hono/streaming'
 
 type Bindings = {
   DB?: any // Cloudflare D1 Database binding
+  ASSETS?: any // Cloudflare Workers static assets binding
   JWT_SECRET?: string
   NODE_ENV?: string
 }
@@ -979,5 +980,13 @@ app.get('/api/health', (c) =>
     federation: 'enabled',
   })
 )
+
+// Fallback to static assets in production on Cloudflare Workers
+app.all('*', async (c) => {
+  if (c.env?.ASSETS) {
+    return await c.env.ASSETS.fetch(c.req.raw)
+  }
+  return c.notFound()
+})
 
 export default app

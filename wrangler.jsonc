@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "chat-web-cfry",
+  "name": "chat-web-cf",
   "main": "src/server/index.ts",
   "compatibility_date": "2024-09-23",
   "compatibility_flags": [
