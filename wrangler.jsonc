@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "chatze-nepalsgry",
+  "main": "worker.js",
+  "compatibility_date": "2024-09-23",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "chatze_db"
+    }
+  ],
+  "triggers": {
+    "crons": [
+      "0 3 * * *"
+    ]
+  },
+  "vars": {
+    "NODE_ENV": "production"
+  },
+  "assets": {
+    "directory": "public",
+    "binding": "ASSETS"
+  }
+}
