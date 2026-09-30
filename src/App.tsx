@@ -56,9 +56,9 @@ export function App() {
           setSetupRequired(false)
           // Default admin profile after setup
           setCurrentUser({
-            id: 'admin_1',
-            username: 'kathmandu_store',
-            displayName: bName,
+            id: 'usr_admin',
+            handle: 'kathmandu_store',
+            display_name: bName,
             role: 'admin',
           })
         }}
