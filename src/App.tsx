@@ -5,7 +5,7 @@ import { MessagingApp } from './components/MessagingApp'
 
 export function App() {
   const [setupRequired, setSetupRequired] = useState<boolean | null>(null)
-  const [businessName, setBusinessName] = useState('New Road Electronics 🇳🇵')
+  const [displayName, setDisplayName] = useState('Chatze User')
   const [currentUser, setCurrentUser] = useState<any>(null)
   const [loading, setLoading] = useState(true)
 
@@ -13,14 +13,21 @@ export function App() {
     async function checkState() {
       try {
         const setupRes = await fetch('/api/setup/status')
-        const setupData = await setupRes.json()
-        if (setupData.setupRequired) {
+        if (setupRes.ok) {
+          const setupData = await setupRes.json()
+          if (setupData.setupRequired) {
+            setSetupRequired(true)
+            setLoading(false)
+            return
+          }
+          setSetupRequired(false)
+          if (setupData.displayName) setDisplayName(setupData.displayName)
+        } else {
+          // If uninitialized or database error, show setup wizard
           setSetupRequired(true)
           setLoading(false)
           return
         }
-        setSetupRequired(false)
-        if (setupData.businessName) setBusinessName(setupData.businessName)
 
         // Check session
         const sessionRes = await fetch('/api/auth/session')
@@ -31,7 +38,8 @@ export function App() {
           }
         }
       } catch (err) {
-        console.error('App init error', err)
+        console.warn('App init status check, defaulting to setup wizard', err)
+        setSetupRequired(true)
       } finally {
         setLoading(false)
       }
@@ -41,9 +49,9 @@ export function App() {
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center text-slate-400 gap-3">
-        <div className="w-8 h-8 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin"></div>
-        <p className="text-xs font-medium tracking-wide">Connecting to Kathmandu Edge...</p>
+      <div className="min-h-screen bg-[#0b141a] flex flex-col items-center justify-center text-[#8696a0] gap-3 font-sans">
+        <div className="w-8 h-8 border-2 border-[#00a884] border-t-transparent rounded-full animate-spin"></div>
+        <p className="text-xs font-medium tracking-wide">Connecting to Edge Cloud...</p>
       </div>
     )
   }
@@ -51,14 +59,13 @@ export function App() {
   if (setupRequired) {
     return (
       <SetupWizard
-        onComplete={(bName) => {
-          setBusinessName(bName)
+        onComplete={(name, handle) => {
+          setDisplayName(name)
           setSetupRequired(false)
-          // Default admin profile after setup
           setCurrentUser({
             id: 'usr_admin',
-            handle: 'kathmandu_store',
-            display_name: bName,
+            handle: handle || 'admin',
+            display_name: name,
             role: 'admin',
           })
         }}
@@ -73,7 +80,7 @@ export function App() {
   return (
     <MessagingApp
       currentUser={currentUser}
-      businessName={businessName}
+      businessName={displayName}
       onLogout={() => setCurrentUser(null)}
     />
   )

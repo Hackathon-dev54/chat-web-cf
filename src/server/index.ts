@@ -13,6 +13,12 @@ const app = new Hono<{ Bindings: Bindings }>()
 
 app.use('*', cors())
 
+// Global safety error handler: NEVER return plain text 500
+app.onError((err, c) => {
+  console.error('[Hono Edge Error]', err)
+  return c.json({ error: err.message || 'Server error', timestamp: Date.now() }, 500)
+})
+
 // ============================================================================
 // 1. In-Memory Process Event Hub (Multi-Device Sync Pipeline: Flow A & B)
 // ============================================================================
@@ -52,137 +58,8 @@ export function broadcastAllStreams(eventName: string, payload: any) {
 }
 
 // ============================================================================
-// 2. WebCrypto ECDSA Key Management (Asymmetric Federation Handshake)
+// 2. In-Memory Fallback State (Always active & synced for 100% uptime)
 // ============================================================================
-let serverKeyPair: { publicKey: CryptoKey; privateKey: CryptoKey } | null = null
-let exportedPublicKeyBase64 = ''
-
-async function ensureServerKeyPair(db?: any): Promise<{ publicKey: CryptoKey; privateKey: CryptoKey }> {
-  if (serverKeyPair) return serverKeyPair
-
-  if (db) {
-    try {
-      const pubRow = await db.prepare("SELECT value FROM system_config WHERE key = 'federation_public_key'").first()
-      const privRow = await db.prepare("SELECT value FROM system_config WHERE key = 'federation_private_key'").first()
-      if (pubRow && privRow) {
-        const pubJwk = JSON.parse(pubRow.value)
-        const privJwk = JSON.parse(privRow.value)
-        const publicKey = await crypto.subtle.importKey(
-          'jwk',
-          pubJwk,
-          { name: 'ECDSA', namedCurve: 'P-256' },
-          true,
-          ['verify']
-        )
-        const privateKey = await crypto.subtle.importKey(
-          'jwk',
-          privJwk,
-          { name: 'ECDSA', namedCurve: 'P-256' },
-          true,
-          ['sign']
-        )
-        serverKeyPair = { publicKey, privateKey }
-        exportedPublicKeyBase64 = btoa(JSON.stringify(pubJwk))
-        return serverKeyPair
-      }
-    } catch (e) {
-      console.warn('[WebCrypto Key Init Warning]', e)
-    }
-  }
-
-  const keyPair = await crypto.subtle.generateKey(
-    { name: 'ECDSA', namedCurve: 'P-256' },
-    true,
-    ['sign', 'verify']
-  )
-  serverKeyPair = keyPair
-
-  const pubJwk = await crypto.subtle.exportKey('jwk', keyPair.publicKey)
-  const privJwk = await crypto.subtle.exportKey('jwk', keyPair.privateKey)
-  exportedPublicKeyBase64 = btoa(JSON.stringify(pubJwk))
-
-  if (db) {
-    try {
-      await db.prepare("INSERT OR REPLACE INTO system_config (key, value) VALUES ('federation_public_key', ?), ('federation_private_key', ?)")
-        .bind(JSON.stringify(pubJwk), JSON.stringify(privJwk)).run()
-    } catch (e) {
-      console.warn('[WebCrypto Key Save Warning]', e)
-    }
-  }
-
-  return serverKeyPair
-}
-
-async function signPayload(payloadString: string): Promise<string> {
-  const keys = await ensureServerKeyPair()
-  const enc = new TextEncoder().encode(payloadString)
-  const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, keys.privateKey, enc)
-  return btoa(String.fromCharCode(...new Uint8Array(sig)))
-}
-
-// ============================================================================
-// 3. Native D1 Database Schema & Self-Healing Migration
-// ============================================================================
-let d1Initialized = false
-async function ensureD1Database(db: any) {
-  if (d1Initialized || !db) return
-  try {
-    await db.exec(`
-      CREATE TABLE IF NOT EXISTS system_config (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS users (
-        id TEXT PRIMARY KEY,
-        handle TEXT UNIQUE NOT NULL,
-        display_name TEXT NOT NULL,
-        password_hash TEXT NOT NULL,
-        role TEXT DEFAULT 'customer',
-        created_at INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS conversations (
-        id TEXT PRIMARY KEY,
-        user_a TEXT NOT NULL,
-        user_b TEXT NOT NULL,
-        remote_handle TEXT,
-        remote_instance_url TEXT,
-        last_message_snippet TEXT,
-        last_message_at INTEGER NOT NULL,
-        status TEXT DEFAULT 'active'
-      );
-
-      CREATE TABLE IF NOT EXISTS messages (
-        id TEXT PRIMARY KEY,
-        conversation_id TEXT NOT NULL,
-        sender_id TEXT NOT NULL,
-        content TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        read_at INTEGER
-      );
-
-      CREATE TABLE IF NOT EXISTS federation_friendships (
-        id TEXT PRIMARY KEY,
-        local_user_id TEXT NOT NULL,
-        remote_handle TEXT NOT NULL,
-        remote_instance_url TEXT NOT NULL,
-        status TEXT DEFAULT 'pending',
-        direction TEXT DEFAULT 'outgoing',
-        created_at INTEGER NOT NULL
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conversation_id, created_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_conversations_user_a ON conversations(user_a, last_message_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_conversations_user_b ON conversations(user_b, last_message_at DESC);
-    `)
-    d1Initialized = true
-  } catch (err: any) {
-    console.warn('[D1 Migration Warning]', err?.message)
-  }
-}
-
-// In-Memory Fallback State (for local development or testing)
 interface MemUser {
   id: string
   handle: string
@@ -230,61 +107,111 @@ const memoryStore = {
   friendships: new Map<string, MemFriendship>(),
 }
 
-// Seed admin and initial welcome conversation
-function seedInitialData() {
-  if (memoryStore.users.size === 0) {
-    const admin: MemUser = {
-      id: 'usr_admin',
-      handle: 'my_store',
-      display_name: 'Chatze Nepal Store 🇳🇵',
-      password_hash: 'admin123',
-      role: 'admin',
-      created_at: Date.now() - 86400000,
+// ============================================================================
+// 3. WebCrypto ECDSA Key Management (Asymmetric Federation Handshake)
+// ============================================================================
+let serverKeyPair: { publicKey: CryptoKey; privateKey: CryptoKey } | null = null
+let exportedPublicKeyBase64 = ''
+
+async function ensureServerKeyPair(db?: any): Promise<{ publicKey: CryptoKey; privateKey: CryptoKey }> {
+  if (serverKeyPair) return serverKeyPair
+
+  if (db) {
+    try {
+      const pubRow: any = await db.prepare("SELECT value FROM system_config WHERE key = 'federation_public_key'").first()
+      const privRow: any = await db.prepare("SELECT value FROM system_config WHERE key = 'federation_private_key'").first()
+      if (pubRow && privRow) {
+        const pubJwk = JSON.parse(pubRow.value)
+        const privJwk = JSON.parse(privRow.value)
+        const publicKey = await crypto.subtle.importKey(
+          'jwk',
+          pubJwk,
+          { name: 'ECDSA', namedCurve: 'P-256' },
+          true,
+          ['verify']
+        )
+        const privateKey = await crypto.subtle.importKey(
+          'jwk',
+          privJwk,
+          { name: 'ECDSA', namedCurve: 'P-256' },
+          true,
+          ['sign']
+        )
+        serverKeyPair = { publicKey, privateKey }
+        exportedPublicKeyBase64 = btoa(JSON.stringify(pubJwk))
+        return serverKeyPair
+      }
+    } catch (e) {
+      console.warn('[WebCrypto Key Init]', e)
     }
-    memoryStore.users.set(admin.id, admin)
+  }
 
-    // Demo peer for testing out-of-the-box
-    const demoFriend: MemFriendship = {
-      id: 'friend_pokhara',
-      local_user_id: admin.id,
-      remote_handle: 'pokhara_shop',
-      remote_instance_url: 'https://pokhara-edge.workers.dev',
-      status: 'active',
-      direction: 'outgoing',
-      created_at: Date.now() - 43200000,
+  const keyPair = await crypto.subtle.generateKey(
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    true,
+    ['sign', 'verify']
+  )
+  serverKeyPair = keyPair
+
+  const pubJwk = await crypto.subtle.exportKey('jwk', keyPair.publicKey)
+  const privJwk = await crypto.subtle.exportKey('jwk', keyPair.privateKey)
+  exportedPublicKeyBase64 = btoa(JSON.stringify(pubJwk))
+
+  if (db) {
+    try {
+      await db.prepare("INSERT OR REPLACE INTO system_config (key, value) VALUES ('federation_public_key', ?), ('federation_private_key', ?)")
+        .bind(JSON.stringify(pubJwk), JSON.stringify(privJwk)).run()
+    } catch (e) {
+      console.warn('[WebCrypto Key Save]', e)
     }
-    memoryStore.friendships.set(demoFriend.id, demoFriend)
+  }
 
-    const conv1: MemConversation = {
-      id: 'conv_pokhara',
-      user_a: admin.id,
-      user_b: 'pokhara_shop',
-      remote_handle: 'pokhara_shop',
-      remote_instance_url: 'https://pokhara-edge.workers.dev',
-      last_message_snippet: 'Namaste! Cross-instance federation is active between Kathmandu and Pokhara.',
-      last_message_at: Date.now() - 1800000,
-      status: 'active',
+  return serverKeyPair
+}
+
+async function signPayload(payloadString: string): Promise<string> {
+  const keys = await ensureServerKeyPair()
+  const enc = new TextEncoder().encode(payloadString)
+  const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, keys.privateKey, enc)
+  return btoa(String.fromCharCode(...new Uint8Array(sig)))
+}
+
+// ============================================================================
+// 4. Safe Bulletproof Cloudflare D1 Migration (Individual statements)
+// ============================================================================
+let d1Initialized = false
+
+const D1_INIT_STATEMENTS = [
+  'CREATE TABLE IF NOT EXISTS system_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
+  'CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL, password_hash TEXT NOT NULL, role TEXT DEFAULT "admin", created_at INTEGER NOT NULL)',
+  'CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, user_a TEXT NOT NULL, user_b TEXT NOT NULL, remote_handle TEXT, remote_instance_url TEXT, last_message_snippet TEXT, last_message_at INTEGER NOT NULL, status TEXT DEFAULT "active")',
+  'CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, sender_id TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL, read_at INTEGER)',
+  'CREATE TABLE IF NOT EXISTS federation_friendships (id TEXT PRIMARY KEY, local_user_id TEXT NOT NULL, remote_handle TEXT NOT NULL, remote_instance_url TEXT NOT NULL, status TEXT DEFAULT "pending", direction TEXT DEFAULT "outgoing", created_at INTEGER NOT NULL)',
+  'CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conversation_id, created_at DESC)',
+  'CREATE INDEX IF NOT EXISTS idx_conversations_user_a ON conversations(user_a, last_message_at DESC)',
+  'CREATE INDEX IF NOT EXISTS idx_conversations_user_b ON conversations(user_b, last_message_at DESC)'
+]
+
+async function ensureD1Database(db: any) {
+  if (d1Initialized || !db) return
+  try {
+    for (const stmt of D1_INIT_STATEMENTS) {
+      try {
+        await db.prepare(stmt).run()
+      } catch (stmtErr: any) {
+        // Continue if already exists or non-fatal
+        console.warn('[D1 stmt warning]', stmtErr?.message)
+      }
     }
-    memoryStore.conversations.set(conv1.id, conv1)
-
-    memoryStore.messages.push({
-      id: 'msg_init_1',
-      conversation_id: conv1.id,
-      sender_id: 'pokhara_shop',
-      content: 'Namaste! Cross-instance federation is active between Kathmandu and Pokhara.',
-      created_at: Date.now() - 1800000,
-      read_at: null,
-    })
-
-    memoryStore.config.set('business_name', 'Chatze Nepal Store')
-    memoryStore.config.set('is_setup', 'true')
+    d1Initialized = true
+  } catch (err: any) {
+    console.warn('[D1 Migration Warning]', err?.message)
   }
 }
-seedInitialData()
 
-// Helper: Normalize URL to standard https origin
+// Normalize URL helper
 function normalizeUrl(url: string): string {
-  let cleaned = url.trim()
+  let cleaned = (url || '').trim()
   if (!cleaned.startsWith('http://') && !cleaned.startsWith('https://')) {
     cleaned = 'https://' + cleaned
   }
@@ -292,68 +219,100 @@ function normalizeUrl(url: string): string {
 }
 
 // ============================================================================
-// 4. Setup Wizard Endpoints
+// 5. First-Launch Setup Wizard & Admin Initialization
 // ============================================================================
 app.get('/api/setup/status', async (c) => {
   const db = c.env?.DB
+
   if (db) {
-    await ensureD1Database(db)
-    const setupRow = await db.prepare("SELECT value FROM system_config WHERE key = 'is_setup'").first()
-    const nameRow = await db.prepare("SELECT value FROM system_config WHERE key = 'business_name'").first()
-    return c.json({
-      setupRequired: !setupRow || setupRow.value !== 'true',
-      businessName: nameRow?.value || 'Chatze Nepal Store',
-    })
+    try {
+      await ensureD1Database(db)
+      const setupRow: any = await db.prepare("SELECT value FROM system_config WHERE key = 'is_setup'").first()
+      const nameRow: any = await db.prepare("SELECT value FROM system_config WHERE key = 'display_name'").first()
+      const hasAdmin: any = await db.prepare("SELECT id FROM users LIMIT 1").first()
+
+      const isSetup = setupRow?.value === 'true' && Boolean(hasAdmin)
+      return c.json({
+        setupRequired: !isSetup,
+        displayName: nameRow?.value || 'Chatze User',
+      })
+    } catch (d1Err: any) {
+      console.warn('[D1 Setup Status Warning, falling back to memory]', d1Err?.message)
+    }
   }
 
-  const isSetup = memoryStore.config.get('is_setup') === 'true'
+  const isSetup = memoryStore.config.get('is_setup') === 'true' && memoryStore.users.size > 0
   return c.json({
     setupRequired: !isSetup,
-    businessName: memoryStore.config.get('business_name') || 'Chatze Nepal Store',
+    displayName: memoryStore.config.get('display_name') || 'Chatze User',
   })
 })
 
 app.post('/api/setup', async (c) => {
-  const { businessName, adminUsername, password } = await c.req.json()
-  const db = c.env?.DB
-  const adminId = 'usr_admin_' + Math.random().toString(36).slice(2, 9)
-  const cleanHandle = (adminUsername || 'admin').replace(/^@/, '')
-  const now = Date.now()
+  try {
+    const body = await c.req.json()
+    const displayName = (body.displayName || body.businessName || 'Chatze User').trim()
+    const cleanHandle = (body.adminUsername || body.username || 'admin').replace(/^@/, '').trim().toLowerCase()
+    const password = body.password || 'admin123'
+    const adminId = 'usr_admin_' + Math.random().toString(36).slice(2, 9)
+    const now = Date.now()
+    const db = c.env?.DB
 
-  if (db) {
-    await ensureD1Database(db)
-    await db.prepare("INSERT OR REPLACE INTO system_config (key, value) VALUES ('is_setup', 'true'), ('business_name', ?)")
-      .bind(businessName).run()
-    await db.prepare("INSERT OR REPLACE INTO users (id, handle, display_name, password_hash, role, created_at) VALUES (?, ?, ?, ?, 'admin', ?)")
-      .bind(adminId, cleanHandle, businessName, password, now).run()
-    await ensureServerKeyPair(db)
-    return c.json({ success: true, adminId, handle: cleanHandle })
-  }
+    // Sync in-memory store
+    memoryStore.config.set('is_setup', 'true')
+    memoryStore.config.set('display_name', displayName)
+    const newAdmin: MemUser = {
+      id: adminId,
+      handle: cleanHandle,
+      display_name: displayName,
+      password_hash: password,
+      role: 'admin',
+      created_at: now,
+    }
+    memoryStore.users.set(adminId, newAdmin)
 
-  memoryStore.config.set('is_setup', 'true')
-  memoryStore.config.set('business_name', businessName || 'My Shop')
-  const newAdmin: MemUser = {
-    id: adminId,
-    handle: cleanHandle,
-    display_name: businessName || 'Shop Admin',
-    password_hash: password || 'admin123',
-    role: 'admin',
-    created_at: now,
+    // Save in D1 if available
+    if (db) {
+      try {
+        await ensureD1Database(db)
+        await db.prepare("INSERT OR REPLACE INTO system_config (key, value) VALUES ('is_setup', 'true'), ('display_name', ?)")
+          .bind(displayName).run()
+        await db.prepare("INSERT OR REPLACE INTO users (id, handle, display_name, password_hash, role, created_at) VALUES (?, ?, ?, ?, 'admin', ?)")
+          .bind(adminId, cleanHandle, displayName, password, now).run()
+        await ensureServerKeyPair(db)
+      } catch (d1Err: any) {
+        console.warn('[D1 Setup Save Warning]', d1Err?.message)
+      }
+    }
+
+    return c.json({
+      success: true,
+      user: {
+        id: adminId,
+        handle: cleanHandle,
+        display_name: displayName,
+        role: 'admin',
+      },
+    })
+  } catch (err: any) {
+    return c.json({ error: err.message || 'Setup failed' }, 400)
   }
-  memoryStore.users.set(adminId, newAdmin)
-  await ensureServerKeyPair()
-  return c.json({ success: true, adminId, handle: newAdmin.handle })
 })
 
 // ============================================================================
-// 5. Auth API
+// 6. Admin Sign In (Only for the owner of this deployed instance)
 // ============================================================================
 app.get('/api/auth/session', async (c) => {
   const db = c.env?.DB
+
   if (db) {
-    await ensureD1Database(db)
-    const admin = await db.prepare("SELECT id, handle, display_name, role, created_at FROM users WHERE role = 'admin' LIMIT 1").first()
-    if (admin) return c.json({ user: admin })
+    try {
+      await ensureD1Database(db)
+      const admin: any = await db.prepare("SELECT id, handle, display_name, role, created_at FROM users WHERE role = 'admin' LIMIT 1").first()
+      if (admin) return c.json({ user: admin })
+    } catch (d1Err: any) {
+      console.warn('[D1 Session Warning]', d1Err?.message)
+    }
   }
 
   const firstAdmin = Array.from(memoryStore.users.values()).find((u) => u.role === 'admin') || Array.from(memoryStore.users.values())[0]
@@ -365,79 +324,68 @@ app.get('/api/auth/session', async (c) => {
 })
 
 app.post('/api/auth/sign-in', async (c) => {
-  const { username, password } = await c.req.json()
-  const cleanHandle = (username || '').replace(/^@/, '')
-  const db = c.env?.DB
+  try {
+    const { username, password } = await c.req.json()
+    const cleanHandle = (username || '').replace(/^@/, '').trim().toLowerCase()
+    const db = c.env?.DB
 
-  if (db) {
-    await ensureD1Database(db)
-    const user = await db.prepare("SELECT * FROM users WHERE handle = ? OR id = ?").bind(cleanHandle, cleanHandle).first()
-    if (user && user.password_hash === password) {
-      const { password_hash, ...safe } = user
+    if (db) {
+      try {
+        await ensureD1Database(db)
+        const user: any = await db.prepare("SELECT * FROM users WHERE handle = ? OR id = ?").bind(cleanHandle, cleanHandle).first()
+        if (user && user.password_hash === password) {
+          const { password_hash, ...safe } = user
+          return c.json({ success: true, user: safe })
+        }
+      } catch (d1Err: any) {
+        console.warn('[D1 Sign In Warning]', d1Err?.message)
+      }
+    }
+
+    const match = Array.from(memoryStore.users.values()).find((u) => u.handle.toLowerCase() === cleanHandle && u.password_hash === password)
+    if (match) {
+      const { password_hash, ...safe } = match
       return c.json({ success: true, user: safe })
     }
-  }
 
-  const match = Array.from(memoryStore.users.values()).find((u) => u.handle === cleanHandle && u.password_hash === password)
-  if (match) {
-    const { password_hash, ...safe } = match
-    return c.json({ success: true, user: safe })
+    return c.json({ error: 'Incorrect username or password' }, 401)
+  } catch (err: any) {
+    return c.json({ error: err.message || 'Sign in error' }, 500)
   }
-  return c.json({ error: 'Invalid handle or password' }, 401)
-})
-
-app.post('/api/auth/sign-up', async (c) => {
-  const { username, displayName, password } = await c.req.json()
-  const cleanHandle = (username || '').replace(/^@/, '')
-  const id = 'usr_' + Math.random().toString(36).slice(2, 9)
-  const now = Date.now()
-  const db = c.env?.DB
-
-  if (db) {
-    await ensureD1Database(db)
-    await db.prepare("INSERT INTO users (id, handle, display_name, password_hash, role, created_at) VALUES (?, ?, ?, ?, 'customer', ?)")
-      .bind(id, cleanHandle, displayName, password, now).run()
-    return c.json({ success: true, user: { id, handle: cleanHandle, display_name: displayName, role: 'customer' } })
-  }
-
-  const newUser: MemUser = {
-    id,
-    handle: cleanHandle,
-    display_name: displayName || cleanHandle,
-    password_hash: password,
-    role: 'customer',
-    created_at: now,
-  }
-  memoryStore.users.set(id, newUser)
-  return c.json({ success: true, user: { id, handle: cleanHandle, display_name: displayName, role: 'customer' } })
 })
 
 // ============================================================================
-// 6. Conversations & Friendships (Federated Multi-Instance Integration)
+// 7. Conversations & Contact List (WhatsApp Style)
 // ============================================================================
 app.get('/api/conversations', async (c) => {
   const db = c.env?.DB
 
   if (db) {
-    await ensureD1Database(db)
-    const convRows = await db.prepare('SELECT * FROM conversations ORDER BY last_message_at DESC LIMIT 100').all()
-    const mapped = (convRows.results || []).map((row: any) => ({
-      id: row.id,
-      otherUser: {
-        id: row.user_b,
-        username: row.remote_handle || row.user_b,
-        displayName: row.remote_handle ? `@${row.remote_handle}` : row.user_b,
-      },
-      status: row.status, // 'active' | 'pending' | 'archived'
-      remoteInstanceUrl: row.remote_instance_url || null,
-      lastMessage: row.last_message_snippet
-        ? {
-            content: row.last_message_snippet,
-            createdAt: row.last_message_at,
-          }
-        : null,
-    }))
-    return c.json({ conversations: mapped })
+    try {
+      await ensureD1Database(db)
+      const convRows: any = await db.prepare('SELECT * FROM conversations ORDER BY last_message_at DESC LIMIT 100').all()
+      if (convRows?.results) {
+        const mapped = convRows.results.map((row: any) => ({
+          id: row.id,
+          otherUser: {
+            id: row.user_b,
+            username: row.remote_handle || row.user_b,
+            displayName: row.remote_handle ? `@${row.remote_handle}` : row.user_b,
+          },
+          status: row.status, // 'active' | 'pending' | 'archived'
+          remoteInstanceUrl: row.remote_instance_url || null,
+          lastMessage: row.last_message_snippet
+            ? {
+                content: row.last_message_snippet,
+                createdAt: row.last_message_at,
+              }
+            : null,
+        }))
+        return c.json({ conversations: mapped })
+      }
+    } catch (d1Err: any) {
+      console.warn('[D1 Conversations Warning]', d1Err?.message)
+    }
   }
 
   const convList = Array.from(memoryStore.conversations.values())
@@ -469,14 +417,20 @@ app.get('/api/conversations', async (c) => {
   return c.json({ conversations: convList })
 })
 
-// Get all incoming and outgoing friend requests
+// Friendships list (Pending incoming, pending outgoing, active)
 app.get('/api/federation/friendships', async (c) => {
   const db = c.env?.DB
 
   if (db) {
-    await ensureD1Database(db)
-    const rows = await db.prepare('SELECT * FROM federation_friendships ORDER BY created_at DESC').all()
-    return c.json({ friendships: rows.results || [] })
+    try {
+      await ensureD1Database(db)
+      const rows: any = await db.prepare('SELECT * FROM federation_friendships ORDER BY created_at DESC').all()
+      if (rows?.results) {
+        return c.json({ friendships: rows.results })
+      }
+    } catch (d1Err: any) {
+      console.warn('[D1 Friendships Warning]', d1Err?.message)
+    }
   }
 
   const list = Array.from(memoryStore.friendships.values()).sort((a, b) => b.created_at - a.created_at)
@@ -484,268 +438,292 @@ app.get('/api/federation/friendships', async (c) => {
 })
 
 // ============================================================================
-// 7. Send Friend Request (Outbound to Remote Peer Instance or Local)
+// 8. Send Friend Request (Outbound to Remote Peer Subdomain / Domain)
 // ============================================================================
 app.post('/api/federation/requests', async (c) => {
-  const { remoteHandle, remoteInstanceUrl, senderId } = await c.req.json()
-  const cleanRemoteHandle = (remoteHandle || '').replace(/^@/, '').trim()
-  const normalizedUrl = normalizeUrl(remoteInstanceUrl)
-  const db = c.env?.DB
-  const localUserId = senderId || 'usr_admin'
+  try {
+    const { remoteHandle, remoteInstanceUrl, senderId } = await c.req.json()
+    const cleanRemoteHandle = (remoteHandle || '').replace(/^@/, '').trim().toLowerCase()
+    const normalizedUrl = normalizeUrl(remoteInstanceUrl)
+    const localUserId = senderId || 'usr_admin'
 
-  const friendshipId = 'freq_' + Math.random().toString(36).slice(2, 9)
-  const conversationId = 'conv_' + cleanRemoteHandle
-  const now = Date.now()
+    const friendshipId = 'freq_' + Math.random().toString(36).slice(2, 9)
+    const conversationId = 'conv_' + cleanRemoteHandle
+    const now = Date.now()
 
-  // 1. Create or update local friendship as pending outgoing
-  const friendshipRecord: MemFriendship = {
-    id: friendshipId,
-    local_user_id: localUserId,
-    remote_handle: cleanRemoteHandle,
-    remote_instance_url: normalizedUrl,
-    status: 'pending',
-    direction: 'outgoing',
-    created_at: now,
-  }
+    const friendshipRecord: MemFriendship = {
+      id: friendshipId,
+      local_user_id: localUserId,
+      remote_handle: cleanRemoteHandle,
+      remote_instance_url: normalizedUrl,
+      status: 'pending',
+      direction: 'outgoing',
+      created_at: now,
+    }
 
-  const convRecord: MemConversation = {
-    id: conversationId,
-    user_a: localUserId,
-    user_b: cleanRemoteHandle,
-    remote_handle: cleanRemoteHandle,
-    remote_instance_url: normalizedUrl,
-    last_message_snippet: `Friend request sent to @${cleanRemoteHandle}`,
-    last_message_at: now,
-    status: 'pending', // 'pending' locks the chat until approved!
-  }
+    const convRecord: MemConversation = {
+      id: conversationId,
+      user_a: localUserId,
+      user_b: cleanRemoteHandle,
+      remote_handle: cleanRemoteHandle,
+      remote_instance_url: normalizedUrl,
+      last_message_snippet: `Friend request sent to @${cleanRemoteHandle}`,
+      last_message_at: now,
+      status: 'pending', // Chat locked until approved
+    }
 
-  if (db) {
-    await ensureD1Database(db)
-    await db.prepare('INSERT OR REPLACE INTO federation_friendships (id, local_user_id, remote_handle, remote_instance_url, status, direction, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .bind(friendshipRecord.id, friendshipRecord.local_user_id, friendshipRecord.remote_handle, friendshipRecord.remote_instance_url, friendshipRecord.status, friendshipRecord.direction, now).run()
-
-    await db.prepare('INSERT OR REPLACE INTO conversations (id, user_a, user_b, remote_handle, remote_instance_url, last_message_snippet, last_message_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .bind(convRecord.id, convRecord.user_a, convRecord.user_b, convRecord.remote_handle, convRecord.remote_instance_url, convRecord.last_message_snippet, now, convRecord.status).run()
-  } else {
     memoryStore.friendships.set(friendshipId, friendshipRecord)
     memoryStore.conversations.set(conversationId, convRecord)
+
+    const db = c.env?.DB
+    if (db) {
+      try {
+        await ensureD1Database(db)
+        await db.prepare('INSERT OR REPLACE INTO federation_friendships (id, local_user_id, remote_handle, remote_instance_url, status, direction, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+          .bind(friendshipRecord.id, friendshipRecord.local_user_id, friendshipRecord.remote_handle, friendshipRecord.remote_instance_url, friendshipRecord.status, friendshipRecord.direction, now).run()
+
+        await db.prepare('INSERT OR REPLACE INTO conversations (id, user_a, user_b, remote_handle, remote_instance_url, last_message_snippet, last_message_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+          .bind(convRecord.id, convRecord.user_a, convRecord.user_b, convRecord.remote_handle, convRecord.remote_instance_url, convRecord.last_message_snippet, now, convRecord.status).run()
+      } catch (d1Err: any) {
+        console.warn('[D1 Outbound Request Warning]', d1Err?.message)
+      }
+    }
+
+    // Non-blocking dispatch to peer instance
+    const myHandle = memoryStore.users.get(localUserId)?.handle || 'me'
+    const myName = memoryStore.config.get('display_name') || 'Chatze User'
+    const myInstanceUrl = c.req.url.replace(/\/api\/.*$/, '')
+
+    const payload = JSON.stringify({
+      from_handle: myHandle,
+      from_display_name: myName,
+      from_instance_url: myInstanceUrl,
+      to_handle: cleanRemoteHandle,
+      timestamp: now,
+    })
+
+    let signature = ''
+    try {
+      signature = await signPayload(payload)
+    } catch (e) {
+      console.warn('[Sign Error]', e)
+    }
+
+    fetch(`${normalizedUrl}/api/federation/v1/requests`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Federation-Signature': signature,
+      },
+      body: payload,
+    }).catch((err) => {
+      console.warn('[Federation Dispatch Warning: Remote peer offline]', err?.message)
+    })
+
+    emitUserEvent(localUserId, 'conversation_updated', convRecord)
+
+    return c.json({
+      success: true,
+      friendship: friendshipRecord,
+      conversation: convRecord,
+    })
+  } catch (err: any) {
+    return c.json({ error: err.message || 'Request failed' }, 400)
   }
-
-  // 2. Dispatch HTTP request to remote peer instance in background
-  const myHandle = memoryStore.users.get(localUserId)?.handle || 'my_store'
-  const myName = memoryStore.config.get('business_name') || 'Chatze Nepal Store'
-  const myInstanceUrl = c.req.url.replace(/\/api\/.*$/, '')
-
-  const payload = JSON.stringify({
-    from_handle: myHandle,
-    from_display_name: myName,
-    from_instance_url: myInstanceUrl,
-    to_handle: cleanRemoteHandle,
-    timestamp: now,
-  })
-
-  // Sign with ECDSA
-  let signature = ''
-  try {
-    signature = await signPayload(payload)
-  } catch (e) {
-    console.warn('[Sign Error]', e)
-  }
-
-  // Non-blocking async dispatch
-  fetch(`${normalizedUrl}/api/federation/v1/requests`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Federation-Signature': signature,
-    },
-    body: payload,
-  }).catch((err) => {
-    console.warn('[Federation Dispatch Warning: Peer might be offline or starting up]', err?.message)
-  })
-
-  // Notify local UI stream
-  emitUserEvent(localUserId, 'conversation_updated', convRecord)
-
-  return c.json({
-    success: true,
-    friendship: friendshipRecord,
-    conversation: convRecord,
-  })
 })
 
-// ============================================================================
-// 8. Inbound Friend Request (Received from Remote Peer Instance)
-// ============================================================================
+// Inbound Friend Request from remote peer
 app.post('/api/federation/v1/requests', async (c) => {
-  const body = await c.req.json()
-  const { from_handle, from_display_name, from_instance_url } = body
-  const db = c.env?.DB
-  const cleanFromHandle = (from_handle || 'peer').replace(/^@/, '')
-  const remoteUrl = normalizeUrl(from_instance_url || '')
-  const now = Date.now()
+  try {
+    const body = await c.req.json()
+    const { from_handle, from_display_name, from_instance_url } = body
+    const cleanFromHandle = (from_handle || 'peer').replace(/^@/, '').trim().toLowerCase()
+    const remoteUrl = normalizeUrl(from_instance_url || '')
+    const now = Date.now()
 
-  const friendshipId = 'freq_in_' + Math.random().toString(36).slice(2, 9)
-  const conversationId = 'conv_' + cleanFromHandle
+    const friendshipId = 'freq_in_' + Math.random().toString(36).slice(2, 9)
+    const conversationId = 'conv_' + cleanFromHandle
 
-  const incomingFriendship: MemFriendship = {
-    id: friendshipId,
-    local_user_id: 'usr_admin',
-    remote_handle: cleanFromHandle,
-    remote_instance_url: remoteUrl,
-    status: 'pending',
-    direction: 'incoming',
-    created_at: now,
-  }
+    const incomingFriendship: MemFriendship = {
+      id: friendshipId,
+      local_user_id: 'usr_admin',
+      remote_handle: cleanFromHandle,
+      remote_instance_url: remoteUrl,
+      status: 'pending',
+      direction: 'incoming',
+      created_at: now,
+    }
 
-  const incomingConv: MemConversation = {
-    id: conversationId,
-    user_a: 'usr_admin',
-    user_b: cleanFromHandle,
-    remote_handle: cleanFromHandle,
-    remote_instance_url: remoteUrl,
-    last_message_snippet: `Connection request from @${cleanFromHandle}`,
-    last_message_at: now,
-    status: 'pending',
-  }
+    const incomingConv: MemConversation = {
+      id: conversationId,
+      user_a: 'usr_admin',
+      user_b: cleanFromHandle,
+      remote_handle: cleanFromHandle,
+      remote_instance_url: remoteUrl,
+      last_message_snippet: `Connection request from @${cleanFromHandle}`,
+      last_message_at: now,
+      status: 'pending',
+    }
 
-  if (db) {
-    await ensureD1Database(db)
-    await db.prepare('INSERT OR REPLACE INTO federation_friendships (id, local_user_id, remote_handle, remote_instance_url, status, direction, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .bind(incomingFriendship.id, incomingFriendship.local_user_id, incomingFriendship.remote_handle, incomingFriendship.remote_instance_url, incomingFriendship.status, incomingFriendship.direction, now).run()
-
-    await db.prepare('INSERT OR REPLACE INTO conversations (id, user_a, user_b, remote_handle, remote_instance_url, last_message_snippet, last_message_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .bind(incomingConv.id, incomingConv.user_a, incomingConv.user_b, incomingConv.remote_handle, incomingConv.remote_instance_url, incomingConv.last_message_snippet, now, incomingConv.status).run()
-  } else {
     memoryStore.friendships.set(friendshipId, incomingFriendship)
     memoryStore.conversations.set(conversationId, incomingConv)
-  }
 
-  // Push instant alert over SSE to current user's screen
-  broadcastAllStreams('incoming_friend_request', {
-    friendship: incomingFriendship,
-    from_handle: cleanFromHandle,
-    from_display_name: from_display_name || `@${cleanFromHandle}`,
-    from_instance_url: remoteUrl,
-  })
+    const db = c.env?.DB
+    if (db) {
+      try {
+        await ensureD1Database(db)
+        await db.prepare('INSERT OR REPLACE INTO federation_friendships (id, local_user_id, remote_handle, remote_instance_url, status, direction, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+          .bind(incomingFriendship.id, incomingFriendship.local_user_id, incomingFriendship.remote_handle, incomingFriendship.remote_instance_url, incomingFriendship.status, incomingFriendship.direction, now).run()
 
-  return c.json({ success: true, status: 'received' }, 201)
-})
-
-// ============================================================================
-// 9. Friend Request Accept & Reject Handshake
-// ============================================================================
-// User clicks "Accept" in UI
-app.post('/api/federation/requests/accept', async (c) => {
-  const { remoteHandle, remoteInstanceUrl } = await c.req.json()
-  const cleanHandle = (remoteHandle || '').replace(/^@/, '').trim()
-  const conversationId = 'conv_' + cleanHandle
-  const db = c.env?.DB
-  const now = Date.now()
-
-  // 1. Mark local friendship and conversation as active
-  if (db) {
-    await ensureD1Database(db)
-    await db.prepare("UPDATE federation_friendships SET status = 'active' WHERE remote_handle = ?").bind(cleanHandle).run()
-    await db.prepare("UPDATE conversations SET status = 'active', last_message_snippet = 'Connected! You can now send messages.' WHERE id = ?").bind(conversationId).run()
-  } else {
-    for (const [, f] of memoryStore.friendships) {
-      if (f.remote_handle === cleanHandle) {
-        f.status = 'active'
+        await db.prepare('INSERT OR REPLACE INTO conversations (id, user_a, user_b, remote_handle, remote_instance_url, last_message_snippet, last_message_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+          .bind(incomingConv.id, incomingConv.user_a, incomingConv.user_b, incomingConv.remote_handle, incomingConv.remote_instance_url, incomingConv.last_message_snippet, now, incomingConv.status).run()
+      } catch (d1Err: any) {
+        console.warn('[D1 Inbound Request Warning]', d1Err?.message)
       }
     }
-    const conv = memoryStore.conversations.get(conversationId)
-    if (conv) {
-      conv.status = 'active'
-      conv.last_message_snippet = 'Connected! You can now send messages.'
-    }
-  }
 
-  // 2. Dual-sided live broadcast: Notify our screen in 0ms
-  broadcastAllStreams('friend_accepted', {
-    remoteHandle: cleanHandle,
-    conversationId,
-    status: 'active',
-  })
-
-  // 3. Dispatch acceptance back to peer instance in non-blocking async
-  if (remoteInstanceUrl) {
-    const myHandle = memoryStore.users.get('usr_admin')?.handle || 'my_store'
-    fetch(`${normalizeUrl(remoteInstanceUrl)}/api/federation/v1/requests/accept`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        from_handle: myHandle,
-        accepted: true,
-        timestamp: now,
-      }),
-    }).catch((err) => {
-      console.warn('[Federation Accept Dispatch Warning]', err?.message)
+    broadcastAllStreams('incoming_friend_request', {
+      friendship: incomingFriendship,
+      from_handle: cleanFromHandle,
+      from_display_name: from_display_name || `@${cleanFromHandle}`,
+      from_instance_url: remoteUrl,
     })
-  }
 
-  return c.json({ success: true, unlocked: true })
+    return c.json({ success: true, status: 'received' }, 201)
+  } catch (err: any) {
+    return c.json({ error: err.message }, 400)
+  }
 })
 
-// Inbound acceptance from peer instance (they approved our request)
-app.post('/api/federation/v1/requests/accept', async (c) => {
-  const { from_handle } = await c.req.json()
-  const cleanHandle = (from_handle || '').replace(/^@/, '').trim()
-  const conversationId = 'conv_' + cleanHandle
-  const db = c.env?.DB
+// ============================================================================
+// 9. Friend Request Accept & Dual-Sided 0ms Live Unlock
+// ============================================================================
+app.post('/api/federation/requests/accept', async (c) => {
+  try {
+    const { remoteHandle, remoteInstanceUrl } = await c.req.json()
+    const cleanHandle = (remoteHandle || '').replace(/^@/, '').trim().toLowerCase()
+    const conversationId = 'conv_' + cleanHandle
+    const now = Date.now()
 
-  if (db) {
-    await ensureD1Database(db)
-    await db.prepare("UPDATE federation_friendships SET status = 'active' WHERE remote_handle = ?").bind(cleanHandle).run()
-    await db.prepare("UPDATE conversations SET status = 'active', last_message_snippet = 'Connected! You can now send messages.' WHERE id = ?").bind(conversationId).run()
-  } else {
     for (const [, f] of memoryStore.friendships) {
-      if (f.remote_handle === cleanHandle) {
-        f.status = 'active'
-      }
+      if (f.remote_handle === cleanHandle) f.status = 'active'
     }
     const conv = memoryStore.conversations.get(conversationId)
     if (conv) {
       conv.status = 'active'
-      conv.last_message_snippet = 'Connected! You can now send messages.'
+      conv.last_message_snippet = 'Connected! You can now message each other.'
     }
+
+    const db = c.env?.DB
+    if (db) {
+      try {
+        await ensureD1Database(db)
+        await db.prepare("UPDATE federation_friendships SET status = 'active' WHERE remote_handle = ?").bind(cleanHandle).run()
+        await db.prepare("UPDATE conversations SET status = 'active', last_message_snippet = 'Connected! You can now message each other.' WHERE id = ?").bind(conversationId).run()
+      } catch (d1Err: any) {
+        console.warn('[D1 Accept Warning]', d1Err?.message)
+      }
+    }
+
+    // Live unlock on local screen
+    broadcastAllStreams('friend_accepted', {
+      remoteHandle: cleanHandle,
+      conversationId,
+      status: 'active',
+    })
+
+    // Forward acceptance to peer instance
+    if (remoteInstanceUrl) {
+      const myHandle = memoryStore.users.get('usr_admin')?.handle || 'me'
+      fetch(`${normalizeUrl(remoteInstanceUrl)}/api/federation/v1/requests/accept`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from_handle: myHandle,
+          accepted: true,
+          timestamp: now,
+        }),
+      }).catch((err) => {
+        console.warn('[Accept Dispatch Warning]', err?.message)
+      })
+    }
+
+    return c.json({ success: true, unlocked: true })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 400)
   }
-
-  // Live broadcast: Instantly unlocks sender's UI from "Waiting for Approval" to "Active"
-  broadcastAllStreams('friend_accepted', {
-    remoteHandle: cleanHandle,
-    conversationId,
-    status: 'active',
-  })
-
-  return c.json({ success: true, status: 'unlocked' })
 })
 
-// Reject / Decline Request
-app.post('/api/federation/requests/reject', async (c) => {
-  const { remoteHandle } = await c.req.json()
-  const cleanHandle = (remoteHandle || '').replace(/^@/, '').trim()
-  const db = c.env?.DB
+// Peer approved our request
+app.post('/api/federation/v1/requests/accept', async (c) => {
+  try {
+    const { from_handle } = await c.req.json()
+    const cleanHandle = (from_handle || '').replace(/^@/, '').trim().toLowerCase()
+    const conversationId = 'conv_' + cleanHandle
 
-  if (db) {
-    await ensureD1Database(db)
-    await db.prepare("DELETE FROM federation_friendships WHERE remote_handle = ?").bind(cleanHandle).run()
-    await db.prepare("DELETE FROM conversations WHERE id = ?").bind('conv_' + cleanHandle).run()
-  } else {
-    for (const [id, f] of memoryStore.friendships) {
-      if (f.remote_handle === cleanHandle) {
-        memoryStore.friendships.delete(id)
+    for (const [, f] of memoryStore.friendships) {
+      if (f.remote_handle === cleanHandle) f.status = 'active'
+    }
+    const conv = memoryStore.conversations.get(conversationId)
+    if (conv) {
+      conv.status = 'active'
+      conv.last_message_snippet = 'Connected! You can now message each other.'
+    }
+
+    const db = c.env?.DB
+    if (db) {
+      try {
+        await ensureD1Database(db)
+        await db.prepare("UPDATE federation_friendships SET status = 'active' WHERE remote_handle = ?").bind(cleanHandle).run()
+        await db.prepare("UPDATE conversations SET status = 'active', last_message_snippet = 'Connected! You can now message each other.' WHERE id = ?").bind(conversationId).run()
+      } catch (d1Err: any) {
+        console.warn('[D1 Remote Accept Warning]', d1Err?.message)
       }
+    }
+
+    broadcastAllStreams('friend_accepted', {
+      remoteHandle: cleanHandle,
+      conversationId,
+      status: 'active',
+    })
+
+    return c.json({ success: true, status: 'unlocked' })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 400)
+  }
+})
+
+// Reject / Decline
+app.post('/api/federation/requests/reject', async (c) => {
+  try {
+    const { remoteHandle } = await c.req.json()
+    const cleanHandle = (remoteHandle || '').replace(/^@/, '').trim().toLowerCase()
+
+    for (const [id, f] of memoryStore.friendships) {
+      if (f.remote_handle === cleanHandle) memoryStore.friendships.delete(id)
     }
     memoryStore.conversations.delete('conv_' + cleanHandle)
-  }
 
-  broadcastAllStreams('friendship_removed', { remoteHandle: cleanHandle })
-  return c.json({ success: true })
+    const db = c.env?.DB
+    if (db) {
+      try {
+        await ensureD1Database(db)
+        await db.prepare("DELETE FROM federation_friendships WHERE remote_handle = ?").bind(cleanHandle).run()
+        await db.prepare("DELETE FROM conversations WHERE id = ?").bind('conv_' + cleanHandle).run()
+      } catch (d1Err: any) {
+        console.warn('[D1 Reject Warning]', d1Err?.message)
+      }
+    }
+
+    broadcastAllStreams('friendship_removed', { remoteHandle: cleanHandle })
+    return c.json({ success: true })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 400)
+  }
 })
 
 // ============================================================================
-// 10. Messages & 0ms Optimistic Delivery + Cross-Peer Federation
+// 10. Messages: 0ms Optimistic Delivery + Cross-Peer Forwarding
 // ============================================================================
 app.get('/api/messaging', async (c) => {
   const conversationId = c.req.query('conversationId')
@@ -753,18 +731,24 @@ app.get('/api/messaging', async (c) => {
   const db = c.env?.DB
 
   if (db) {
-    await ensureD1Database(db)
-    const rows = await db.prepare('SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC')
-      .bind(conversationId).all()
-    const mapped = (rows.results || []).map((r: any) => ({
-      id: r.id,
-      conversationId: r.conversation_id,
-      senderId: r.sender_id,
-      body: r.content,
-      createdAt: new Date(r.created_at).toISOString(),
-      readAt: r.read_at ? new Date(r.read_at).toISOString() : null,
-    }))
-    return c.json({ messages: mapped })
+    try {
+      await ensureD1Database(db)
+      const rows: any = await db.prepare('SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC')
+        .bind(conversationId).all()
+      if (rows?.results) {
+        const mapped = rows.results.map((r: any) => ({
+          id: r.id,
+          conversationId: r.conversation_id,
+          senderId: r.sender_id,
+          body: r.content,
+          createdAt: new Date(r.created_at).toISOString(),
+          readAt: r.read_at ? new Date(r.read_at).toISOString() : null,
+        }))
+        return c.json({ messages: mapped })
+      }
+    } catch (d1Err: any) {
+      console.warn('[D1 Messages Warning]', d1Err?.message)
+    }
   }
 
   const msgs = memoryStore.messages
@@ -783,30 +767,22 @@ app.get('/api/messaging', async (c) => {
 })
 
 app.post('/api/messaging', async (c) => {
-  const { conversationId, body, senderId, tempId, remoteInstanceUrl, remoteHandle } = await c.req.json()
-  const db = c.env?.DB
-  const messageId = 'msg_' + Math.random().toString(36).slice(2, 9)
-  const now = Date.now()
-  const actualSender = senderId || 'usr_admin'
+  try {
+    const { conversationId, body, senderId, tempId, remoteInstanceUrl, remoteHandle } = await c.req.json()
+    const messageId = 'msg_' + Math.random().toString(36).slice(2, 9)
+    const now = Date.now()
+    const actualSender = senderId || 'usr_admin'
 
-  const messageRecord = {
-    id: messageId,
-    conversationId: conversationId || 'conv_general',
-    senderId: actualSender,
-    body: body || '',
-    createdAt: new Date(now).toISOString(),
-    readAt: null,
-    tempId: tempId || null,
-  }
+    const messageRecord = {
+      id: messageId,
+      conversationId: conversationId || 'conv_general',
+      senderId: actualSender,
+      body: body || '',
+      createdAt: new Date(now).toISOString(),
+      readAt: null,
+      tempId: tempId || null,
+    }
 
-  // 1. Write to local database (~8ms)
-  if (db) {
-    await ensureD1Database(db)
-    await db.prepare('INSERT INTO messages (id, conversation_id, sender_id, content, created_at, read_at) VALUES (?, ?, ?, ?, ?, NULL)')
-      .bind(messageRecord.id, messageRecord.conversationId, messageRecord.senderId, messageRecord.body, now).run()
-    await db.prepare('UPDATE conversations SET last_message_snippet = ?, last_message_at = ? WHERE id = ?')
-      .bind(messageRecord.body, now, messageRecord.conversationId).run()
-  } else {
     memoryStore.messages.push({
       id: messageRecord.id,
       conversation_id: messageRecord.conversationId,
@@ -820,62 +796,69 @@ app.post('/api/messaging', async (c) => {
       conv.last_message_snippet = messageRecord.body
       conv.last_message_at = now
     }
+
+    const db = c.env?.DB
+    if (db) {
+      try {
+        await ensureD1Database(db)
+        await db.prepare('INSERT INTO messages (id, conversation_id, sender_id, content, created_at, read_at) VALUES (?, ?, ?, ?, ?, NULL)')
+          .bind(messageRecord.id, messageRecord.conversationId, messageRecord.senderId, messageRecord.body, now).run()
+        await db.prepare('UPDATE conversations SET last_message_snippet = ?, last_message_at = ? WHERE id = ?')
+          .bind(messageRecord.body, now, messageRecord.conversationId).run()
+      } catch (d1Err: any) {
+        console.warn('[D1 Message Insert Warning]', d1Err?.message)
+      }
+    }
+
+    // Emit live to sender's other tabs
+    emitUserEvent(actualSender, 'new_message', messageRecord)
+    broadcastAllStreams('new_message', messageRecord)
+
+    // Forward to peer instance if remote
+    const targetUrl = remoteInstanceUrl || memoryStore.conversations.get(conversationId)?.remote_instance_url
+    if (targetUrl) {
+      const myHandle = memoryStore.users.get(actualSender)?.handle || 'me'
+      const targetHandle = remoteHandle || memoryStore.conversations.get(conversationId)?.remote_handle
+
+      fetch(`${normalizeUrl(targetUrl)}/api/federation/v1/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sender_handle: myHandle,
+          recipient_handle: targetHandle,
+          body: messageRecord.body,
+          conversation_id: 'conv_' + myHandle,
+          timestamp: now,
+        }),
+      }).catch((err) => {
+        console.warn('[Remote Forward Warning]', err?.message)
+      })
+    }
+
+    return c.json({ success: true, message: messageRecord }, 201)
+  } catch (err: any) {
+    return c.json({ error: err.message }, 400)
   }
-
-  // 2. Flow B: Multi-Device Sync - Emit to sender's other devices (<25ms)
-  emitUserEvent(actualSender, 'new_message', messageRecord)
-  broadcastAllStreams('new_message', messageRecord)
-
-  // 3. Flow A: If peer is remote, dispatch over HTTP federation to remote instance!
-  const targetUrl = remoteInstanceUrl || memoryStore.conversations.get(conversationId)?.remote_instance_url
-  if (targetUrl) {
-    const myHandle = memoryStore.users.get(actualSender)?.handle || 'my_store'
-    const targetHandle = remoteHandle || memoryStore.conversations.get(conversationId)?.remote_handle
-
-    fetch(`${normalizeUrl(targetUrl)}/api/federation/v1/messages`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sender_handle: myHandle,
-        recipient_handle: targetHandle,
-        body: messageRecord.body,
-        conversation_id: 'conv_' + myHandle,
-        timestamp: now,
-      }),
-    }).catch((err) => {
-      console.warn('[Remote Federation Dispatch Warning]', err?.message)
-    })
-  }
-
-  // 4. Return HTTP 201 Created with swapped permanent ID
-  return c.json({ success: true, message: messageRecord }, 201)
 })
 
-// Inbound message from remote peer instance
+// Peer sent a message to us
 app.post('/api/federation/v1/messages', async (c) => {
-  const { sender_handle, body, timestamp } = await c.req.json()
-  const cleanSender = (sender_handle || 'remote_peer').replace(/^@/, '')
-  const conversationId = 'conv_' + cleanSender
-  const messageId = 'msg_in_' + Math.random().toString(36).slice(2, 9)
-  const now = timestamp || Date.now()
-  const db = c.env?.DB
+  try {
+    const { sender_handle, body, timestamp } = await c.req.json()
+    const cleanSender = (sender_handle || 'peer').replace(/^@/, '').trim().toLowerCase()
+    const conversationId = 'conv_' + cleanSender
+    const messageId = 'msg_in_' + Math.random().toString(36).slice(2, 9)
+    const now = timestamp || Date.now()
 
-  const messageRecord = {
-    id: messageId,
-    conversationId,
-    senderId: cleanSender,
-    body: body || '',
-    createdAt: new Date(now).toISOString(),
-    readAt: null,
-  }
+    const messageRecord = {
+      id: messageId,
+      conversationId,
+      senderId: cleanSender,
+      body: body || '',
+      createdAt: new Date(now).toISOString(),
+      readAt: null,
+    }
 
-  if (db) {
-    await ensureD1Database(db)
-    await db.prepare('INSERT INTO messages (id, conversation_id, sender_id, content, created_at, read_at) VALUES (?, ?, ?, ?, ?, NULL)')
-      .bind(messageRecord.id, messageRecord.conversationId, messageRecord.senderId, messageRecord.body, now).run()
-    await db.prepare('UPDATE conversations SET last_message_snippet = ?, last_message_at = ? WHERE id = ?')
-      .bind(messageRecord.body, now, conversationId).run()
-  } else {
     memoryStore.messages.push({
       id: messageRecord.id,
       conversation_id: messageRecord.conversationId,
@@ -889,12 +872,25 @@ app.post('/api/federation/v1/messages', async (c) => {
       conv.last_message_snippet = messageRecord.body
       conv.last_message_at = now
     }
+
+    const db = c.env?.DB
+    if (db) {
+      try {
+        await ensureD1Database(db)
+        await db.prepare('INSERT INTO messages (id, conversation_id, sender_id, content, created_at, read_at) VALUES (?, ?, ?, ?, ?, NULL)')
+          .bind(messageRecord.id, messageRecord.conversationId, messageRecord.senderId, messageRecord.body, now).run()
+        await db.prepare('UPDATE conversations SET last_message_snippet = ?, last_message_at = ? WHERE id = ?')
+          .bind(messageRecord.body, now, conversationId).run()
+      } catch (d1Err: any) {
+        console.warn('[D1 Peer Inbound Message Warning]', d1Err?.message)
+      }
+    }
+
+    broadcastAllStreams('new_message', messageRecord)
+    return c.json({ success: true, id: messageId }, 201)
+  } catch (err: any) {
+    return c.json({ error: err.message }, 400)
   }
-
-  // Push directly to recipient's screen over SSE in <20ms
-  broadcastAllStreams('new_message', messageRecord)
-
-  return c.json({ success: true, id: messageId }, 201)
 })
 
 // ============================================================================
@@ -919,18 +915,16 @@ app.get('/api/stream', (c) => {
     }
     activeStreams.get(userId)!.add(clientRecord)
 
-    // Initial connected packet
     await stream.writeSSE({
       event: 'connected',
       data: JSON.stringify({
         clientId,
         userId,
         timestamp: Date.now(),
-        edgeNode: 'KTM-Nepal-PoP',
+        edgeNode: 'Kathmandu (KTM) PoP',
       }),
     })
 
-    // 8-Second Keep-Alive Heartbeat
     const pingInterval = setInterval(async () => {
       try {
         await stream.writeSSE({
@@ -948,7 +942,6 @@ app.get('/api/stream', (c) => {
       activeStreams.get(userId)?.delete(clientRecord)
     })
 
-    // Cloudflare Workers stream lifetime: 95 seconds
     await new Promise((resolve) => setTimeout(resolve, 95000))
     clearInterval(pingInterval)
     activeStreams.get(userId)?.delete(clientRecord)
@@ -960,12 +953,12 @@ app.get('/api/stream', (c) => {
 // ============================================================================
 app.get('/api/federation/identity', async (c) => {
   await ensureServerKeyPair(c.env?.DB)
-  const myHandle = memoryStore.users.get('usr_admin')?.handle || 'my_store'
+  const myHandle = memoryStore.users.get('usr_admin')?.handle || 'admin'
   return c.json({
     version: '1.0.0',
     instance_url: c.req.url.replace(/\/api\/.*$/, ''),
     handle: myHandle,
-    name: memoryStore.config.get('business_name') || 'Chatze Nepal Store 🇳🇵',
+    name: memoryStore.config.get('display_name') || 'Chatze User',
     public_key: exportedPublicKeyBase64,
     algorithm: 'ECDSA-P256-SHA256',
     created_at: Date.now(),
