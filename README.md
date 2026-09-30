@@ -1,17 +1,17 @@
 # Chatze (Nepal Edition) — Zero-Setup Cloudflare Edge Architecture
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Hackathon-dev54/chat-web-cfry)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Hackathon-dev54/chat-web-cf)
 [![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
 [![Cloudflare D1](https://img.shields.io/badge/Database-Cloudflare%20D1%20(5GB%20Free)-orange.svg)](https://developers.cloudflare.com/d1/)
 [![Edge Network](https://img.shields.io/badge/PoP-Kathmandu%20(KTM)%20Edge-blue.svg)](https://www.cloudflare.com/network/)
 
-> **100% Free-Forever, Zero-Setup, One-Click Deploy on Cloudflare with Zero External Accounts** (No Neon, No Vercel, No Redis required). Built specifically for high-volume businesses and shops in Nepal (handling 5,000–6,000 daily customers).
+> **100% Free-Forever, Zero-Setup, One-Click Deploy on Cloudflare with Zero External Accounts** (No Neon, No Vercel, No Redis required). Built specifically for high-volume businesses and shops in Nepal (handling 5,000–6,000 daily customers) and independent peer-to-peer federated instances.
 
 ---
 
 ## 🚀 1-Click Deploy to Cloudflare (The 60-Second Setup)
 
-1. Click the **[Deploy to Cloudflare](https://deploy.workers.cloudflare.com/?url=https://github.com/Hackathon-dev54/chat-web-cfry)** badge above.
+1. Click the **[Deploy to Cloudflare](https://deploy.workers.cloudflare.com/?url=https://github.com/Hackathon-dev54/chat-web-cf)** badge above.
 2. Sign in to your Cloudflare account (100% Free).
 3. Cloudflare automatically reads `wrangler.jsonc`:
    - Provisions Cloudflare Native D1 database `chatze_db` (**5 GB Free SQLite Edge DB**).
@@ -91,6 +91,18 @@
 
 ---
 
+## 🌐 Independent Deployable Peer Federation
+
+Each user or business can deploy their own completely independent instance to their own Cloudflare account (e.g., `https://alice.workers.dev` and `https://bob.workers.dev` or custom domains):
+
+1. **Send Friend Request**: Click **"+ Connect Peer"** in the sidebar. Enter your friend's handle (e.g., `@bob`) and their deployed domain (e.g., `bob.workers.dev`).
+2. **Pending Approval**: The conversation is stored in your queue marked `⏳ Pending`. The chat stays securely locked until approved.
+3. **Acceptance Handshake**: When the remote peer opens their app, an **"Incoming Connection Request"** banner appears with **Accept** and **Decline** options.
+4. **Instant Dual-Sided Unlock**: Clicking **Accept** cryptographically activates the friendship on both instances in **0ms** over SSE.
+5. **Real-Time Cross-Instance Messaging**: Messages sent from Alice's instance are stored in Alice's database, optimistically rendered in 0ms, and asynchronously dispatched to Bob's instance via `POST /api/federation/v1/messages` for instant rendering (<20ms).
+
+---
+
 ## 🔐 Zero-Config WebCrypto Cryptographic Federation
 
 No shared static passwords or manual `.env` secrets:
@@ -118,8 +130,8 @@ This guarantees 100% of your daily request budget is reserved exclusively for do
 
 ```bash
 # Clone the repository
-git clone https://github.com/Hackathon-dev54/chat-web-cfry.git
-cd chat-web-cfry
+git clone https://github.com/Hackathon-dev54/chat-web-cf.git
+cd chat-web-cf
 
 # Install dependencies
 npm install
