@@ -867,7 +867,12 @@ export function MessagingApp({
                 className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-3 min-h-0 bg-[#0b141a]"
               >
                 {messages.map((msg) => {
-                  const isMe = msg.senderId === currentUser.id
+                  const otherHandle = (activeConv.otherUser.username || '').replace(/^@/, '').trim().toLowerCase()
+                  const senderClean = (msg.senderId || '').replace(/^@/, '').trim().toLowerCase()
+                  // In a 1-on-1 direct conversation, it is from the other user ONLY if the sender is their handle.
+                  // Otherwise, it was sent by ME (from PC, mobile, or any session) -> Right side (Green).
+                  const isFromOther = senderClean === otherHandle
+                  const isMe = !isFromOther
                   return (
                     <div key={msg.id} className={`flex ${isMe ? 'justify-end' : 'justify-start'}`}>
                       <div

@@ -1107,6 +1107,7 @@ app.post('/api/federation/v1/messages', async (c) => {
 // ============================================================================
 app.get('/api/stream', (c) => {
   const userId = c.req.query('userId') || 'usr_admin'
+  const db = c.env?.DB
 
   return streamSSE(c, async (stream) => {
     const clientId = 'client_' + Math.random().toString(36).slice(2, 9)
@@ -1134,25 +1135,87 @@ app.get('/api/stream', (c) => {
       }),
     })
 
-    const pingInterval = setInterval(async () => {
+    let lastKnownMessageTime = Date.now() - 5000
+    let lastKnownFriendshipTime = Date.now() - 5000
+
+    // High-performance, zero-client-invocation edge poller:
+    // Runs inside the single open SSE streaming connection every 3 seconds.
+    // Checks D1/memory across isolates for new messages or requests.
+    const pollInterval = setInterval(async () => {
       try {
+        if (db) {
+          // Check for any new incoming or cross-device messages
+          const rows: any = await db.prepare(
+            'SELECT * FROM messages WHERE created_at > ? ORDER BY created_at ASC LIMIT 10'
+          ).bind(lastKnownMessageTime).all()
+
+          if (rows?.results && rows.results.length > 0) {
+            for (const r of rows.results) {
+              lastKnownMessageTime = Math.max(lastKnownMessageTime, r.created_at)
+              await stream.writeSSE({
+                event: 'new_message',
+                data: JSON.stringify({
+                  id: r.id,
+                  conversationId: r.conversation_id,
+                  senderId: r.sender_id,
+                  body: r.content,
+                  createdAt: new Date(r.created_at).toISOString(),
+                  readAt: r.read_at ? new Date(r.read_at).toISOString() : null,
+                }),
+              })
+            }
+          }
+
+          // Check for new friendships / connection requests
+          const fRows: any = await db.prepare(
+            'SELECT * FROM federation_friendships WHERE created_at > ? ORDER BY created_at ASC LIMIT 5'
+          ).bind(lastKnownFriendshipTime).all()
+
+          if (fRows?.results && fRows.results.length > 0) {
+            for (const f of fRows.results) {
+              lastKnownFriendshipTime = Math.max(lastKnownFriendshipTime, f.created_at)
+              if (f.direction === 'incoming' && f.status === 'pending') {
+                await stream.writeSSE({
+                  event: 'incoming_friend_request',
+                  data: JSON.stringify({
+                    friendship: f,
+                    from_handle: f.remote_handle,
+                    from_display_name: `@${f.remote_handle}`,
+                    from_instance_url: f.remote_instance_url,
+                  }),
+                })
+              } else if (f.status === 'active') {
+                await stream.writeSSE({
+                  event: 'friend_accepted',
+                  data: JSON.stringify({
+                    remoteHandle: f.remote_handle,
+                    conversationId: 'conv_' + f.remote_handle,
+                    status: 'active',
+                  }),
+                })
+              }
+            }
+          }
+        }
+
+        // Heartbeat ping
         await stream.writeSSE({
           event: 'ping',
           data: JSON.stringify({ t: Date.now() }),
         })
       } catch {
-        clearInterval(pingInterval)
+        clearInterval(pollInterval)
         activeStreams.get(userId)?.delete(clientRecord)
       }
-    }, 15000)
+    }, 4000)
 
     stream.onAbort(() => {
-      clearInterval(pingInterval)
+      clearInterval(pollInterval)
       activeStreams.get(userId)?.delete(clientRecord)
     })
 
     await new Promise((resolve) => setTimeout(resolve, 95000))
-    clearInterval(pingInterval)
+    clearInterval(pollInterval)
     activeStreams.get(userId)?.delete(clientRecord)
   })
 })
