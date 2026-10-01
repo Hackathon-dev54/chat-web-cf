@@ -18,7 +18,97 @@ import {
   Share2,
   Copy,
   AlertCircle,
+  Image as ImageIcon,
+  Download,
+  Maximize2,
+  Loader2,
 } from 'lucide-react'
+
+// ============================================================================
+// wsrv.nl Global Image Cache & Resizing Proxy Integration
+// Free, open-source image cache and resizing proxy: https://wsrv.nl
+// ============================================================================
+export function getOptimizedImageUrl(rawUrl: string, width = 800): string {
+  if (!rawUrl) return ''
+  // If it's a local data URI (pre-upload preview), return directly
+  if (rawUrl.startsWith('data:image')) return rawUrl
+  // If already routed through wsrv.nl, return as is
+  if (rawUrl.includes('wsrv.nl')) return rawUrl
+
+  const cleanUrl = rawUrl.startsWith('//') ? 'https:' + rawUrl : rawUrl
+  return `https://wsrv.nl/?url=${encodeURIComponent(cleanUrl)}&w=${width}&output=webp&q=80`
+}
+
+interface ParsedMessage {
+  isImage: boolean
+  imageUrl?: string
+  caption?: string
+  text?: string
+}
+
+export function parseMessageContent(body: string): ParsedMessage {
+  if (!body) return { isImage: false, text: '' }
+
+  // Pattern 1: [img:URL] or [img:URL|caption]
+  const imgTagMatch = body.match(/^\[img:(https?:\/\/[^\s|\]]+)(?:\|(.*))?\]$/i)
+  if (imgTagMatch) {
+    return {
+      isImage: true,
+      imageUrl: imgTagMatch[1],
+      caption: imgTagMatch[2] ? imgTagMatch[2].trim() : undefined,
+    }
+  }
+
+  // Pattern 2: Direct public image URL or media endpoint
+  const isDirectImage =
+    /^https?:\/\/[^\s]+\.(jpg|jpeg|png|webp|gif|svg)(\?[^\s]*)?$/i.test(body.trim()) ||
+    /^https?:\/\/[^\s]+\/api\/media\/med_[a-z0-9]+/i.test(body.trim())
+
+  if (isDirectImage) {
+    return {
+      isImage: true,
+      imageUrl: body.trim(),
+    }
+  }
+
+  return { isImage: false, text: body }
+}
+
+// Client-side HTML5 canvas compression before sending to Cloudflare
+export async function compressImageToWebP(file: File, maxDim = 900, quality = 0.75): Promise<{ dataUrl: string; sizeKb: number }> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      const img = new window.Image()
+      img.onload = () => {
+        let width = img.width
+        let height = img.height
+        if (width > maxDim || height > maxDim) {
+          if (width > height) {
+            height = Math.round((height * maxDim) / width)
+            width = maxDim
+          } else {
+            width = Math.round((width * maxDim) / height)
+            height = maxDim
+          }
+        }
+        const canvas = document.createElement('canvas')
+        canvas.width = width
+        canvas.height = height
+        const ctx = canvas.getContext('2d')
+        if (!ctx) return reject(new Error('Canvas context not available'))
+        ctx.drawImage(img, 0, 0, width, height)
+        const dataUrl = canvas.toDataURL('image/webp', quality)
+        const sizeKb = Math.round((dataUrl.length * (3 / 4)) / 1024)
+        resolve({ dataUrl, sizeKb })
+      }
+      img.onerror = reject
+      img.src = e.target?.result as string
+    }
+    reader.onerror = reject
+    reader.readAsDataURL(file)
+  })
+}
 
 interface Conversation {
   id: string
@@ -93,10 +183,82 @@ export function MessagingApp({
   const [hasNewUnreadWhileScrolled, setHasNewUnreadWhileScrolled] = useState(false)
   const [showQrModal, setShowQrModal] = useState(false)
 
+  // Media attachments & wsrv.nl proxy state
+  const [selectedImageFile, setSelectedImageFile] = useState<{ dataUrl: string; caption: string; sizeKb: number } | null>(null)
+  const [isUploadingImage, setIsUploadingImage] = useState(false)
+  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
   const messagesContainerRef = useRef<HTMLDivElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const activeConvRef = useRef<Conversation | null>(null)
   activeConvRef.current = activeConv
+
+  const handleFileInputChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    e.target.value = ''
+    try {
+      const { dataUrl, sizeKb } = await compressImageToWebP(file)
+      setSelectedImageFile({ dataUrl, caption: '', sizeKb })
+    } catch (err) {
+      console.error('Image compression error', err)
+      alert('Failed to process image. Please try a different photo.')
+    }
+  }
+
+  const handlePaste = async (e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items
+    if (!items) return
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.startsWith('image/')) {
+        const file = items[i].getAsFile()
+        if (file) {
+          e.preventDefault()
+          try {
+            const { dataUrl, sizeKb } = await compressImageToWebP(file)
+            setSelectedImageFile({ dataUrl, caption: '', sizeKb })
+          } catch (err) {
+            console.error('Clipboard image error', err)
+          }
+          break
+        }
+      }
+    }
+  }
+
+  const handleSendImage = async () => {
+    if (!selectedImageFile || !activeConv) return
+    setIsUploadingImage(true)
+    try {
+      const uploadRes = await fetch('/api/media/upload', {
+        method: 'POST',
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          data: selectedImageFile.dataUrl,
+          contentType: 'image/webp',
+        }),
+      })
+      const uploadData = await uploadRes.json()
+      if (!uploadRes.ok || !uploadData.url) {
+        alert(uploadData.error || 'Failed to upload photo')
+        return
+      }
+
+      const publicUrl = uploadData.url
+      const formattedBody = selectedImageFile.caption?.trim()
+        ? `[img:${publicUrl}|${selectedImageFile.caption.trim()}]`
+        : `[img:${publicUrl}]`
+
+      setSelectedImageFile(null)
+      await handleSendMessage(undefined, formattedBody)
+    } catch (err: any) {
+      console.error('Image send error', err)
+      alert('Failed to send image: ' + (err?.message || 'Network error'))
+    } finally {
+      setIsUploadingImage(false)
+    }
+  }
 
   const getAuthHeaders = (extra: Record<string, string> = {}) => {
     const token = typeof window !== 'undefined' ? localStorage.getItem('chatze_auth_token') : null
@@ -869,19 +1031,48 @@ export function MessagingApp({
                   // Otherwise, it was sent by ME (from PC, mobile, or any session) -> Right side (Green).
                   const isFromOther = senderClean === otherHandle
                   const isMe = !isFromOther
+                  const parsed = parseMessageContent(msg.body)
+
                   return (
                     <div key={msg.id} className={`flex ${isMe ? 'justify-end' : 'justify-start'}`}>
                       <div
-                        className={`max-w-[85%] sm:max-w-[75%] rounded-2xl px-3.5 sm:px-4 py-2 text-sm shadow-sm transition-all ${
+                        className={`max-w-[85%] sm:max-w-[70%] md:max-w-[55%] rounded-2xl ${
+                          parsed.isImage ? 'p-1.5' : 'px-3.5 sm:px-4 py-2'
+                        } text-sm shadow-sm transition-all ${
                           isMe
                             ? 'bg-[#005c4b] text-[#e9edef] rounded-br-none'
                             : 'bg-[#202c33] text-[#e9edef] rounded-bl-none'
                         }`}
                       >
-                        <p className="break-words leading-relaxed text-[13px] sm:text-sm">{msg.body}</p>
-                        <div
-                          className={`flex items-center justify-end gap-1 mt-1 text-[10px] text-[#8696a0]`}
-                        >
+                        {parsed.isImage && parsed.imageUrl ? (
+                          <div className="space-y-1.5">
+                            <div
+                              onClick={() => setLightboxUrl(parsed.imageUrl!)}
+                              className="relative group rounded-xl overflow-hidden cursor-pointer bg-[#111b21] max-h-[380px] flex items-center justify-center border border-white/5"
+                            >
+                              <img
+                                src={getOptimizedImageUrl(parsed.imageUrl, 700)}
+                                alt={parsed.caption || 'Photo message'}
+                                loading="lazy"
+                                className="w-full h-auto max-h-[380px] object-cover rounded-xl transition-transform duration-200 group-hover:scale-[1.02]"
+                              />
+                              <div className="absolute inset-0 bg-black/30 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-2 text-white">
+                                <span className="p-2 rounded-full bg-black/60 backdrop-blur-sm">
+                                  <Maximize2 className="w-4 h-4" />
+                                </span>
+                              </div>
+                            </div>
+                            {parsed.caption && (
+                              <p className="px-2 pt-0.5 break-words leading-relaxed text-[13px] sm:text-sm">
+                                {parsed.caption}
+                              </p>
+                            )}
+                          </div>
+                        ) : (
+                          <p className="break-words leading-relaxed text-[13px] sm:text-sm">{msg.body}</p>
+                        )}
+
+                        <div className={`flex items-center justify-end gap-1 ${parsed.isImage ? 'px-2 pb-1 pt-0.5' : 'mt-1'} text-[10px] text-[#8696a0]`}>
                           <span>
                             {new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                           </span>
@@ -938,8 +1129,26 @@ export function MessagingApp({
             {/* Input Composer Bar */}
             <form
               onSubmit={handleSendMessage}
+              onPaste={handlePaste}
               className="p-2.5 sm:p-3.5 border-t border-[#202c33] bg-[#202c33]/50 flex items-center gap-2 sm:gap-3 shrink-0"
             >
+              <input
+                type="file"
+                ref={fileInputRef}
+                accept="image/*"
+                onChange={handleFileInputChange}
+                className="hidden"
+              />
+              <button
+                type="button"
+                disabled={activeConv.status === 'pending'}
+                onClick={() => fileInputRef.current?.click()}
+                className="p-2 sm:p-2.5 text-[#8696a0] hover:text-[#00a884] hover:bg-[#2a3942] rounded-xl transition-all cursor-pointer disabled:opacity-40 shrink-0"
+                title="Attach & Send Photo (or Paste with Ctrl+V)"
+              >
+                <ImageIcon className="w-5 h-5" />
+              </button>
+
               <input
                 type="text"
                 disabled={activeConv.status === 'pending'}
@@ -948,7 +1157,7 @@ export function MessagingApp({
                 placeholder={
                   activeConv.status === 'pending'
                     ? 'Waiting for contact to approve...'
-                    : 'Type a message (Enter to send)...'
+                    : 'Type a message or paste photo (Ctrl+V)...'
                 }
                 className="flex-1 bg-[#2a3942] border border-[#222e35] rounded-xl px-3 sm:px-4 py-2 sm:py-2.5 text-xs sm:text-sm text-[#e9edef] placeholder-[#8696a0] focus:outline-none focus:border-[#00a884] disabled:opacity-40 transition-all"
               />
@@ -1144,6 +1353,119 @@ export function MessagingApp({
             >
               Share QR in Chat
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* 6. Image Preview & Send Modal */}
+      {selectedImageFile && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-4 z-50">
+          <div className="max-w-md w-full bg-[#111b21] border border-[#202c33] rounded-2xl p-4 sm:p-5 shadow-2xl space-y-3.5">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold text-[#e9edef] flex items-center gap-1.5">
+                <ImageIcon className="w-4 h-4 text-[#00a884]" /> Send Photo
+              </span>
+              <button
+                disabled={isUploadingImage}
+                onClick={() => setSelectedImageFile(null)}
+                className="text-[#8696a0] hover:text-[#e9edef] disabled:opacity-40"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="relative rounded-xl overflow-hidden bg-black/50 max-h-[300px] sm:max-h-[360px] flex items-center justify-center border border-white/5">
+              <img
+                src={selectedImageFile.dataUrl}
+                alt="Upload preview"
+                className="w-full h-auto max-h-[300px] sm:max-h-[360px] object-contain rounded-xl"
+              />
+              <span className="absolute bottom-2 right-2 px-2 py-0.5 rounded-full bg-black/70 backdrop-blur-sm text-[10px] text-[#00a884] font-mono">
+                ~{selectedImageFile.sizeKb} KB (Edge Optimized)
+              </span>
+            </div>
+
+            <div className="space-y-1">
+              <input
+                type="text"
+                disabled={isUploadingImage}
+                value={selectedImageFile.caption}
+                onChange={(e) => setSelectedImageFile((prev) => prev ? { ...prev, caption: e.target.value } : null)}
+                placeholder="Add a caption... (optional)"
+                className="w-full px-3.5 py-2.5 bg-[#202c33] border border-[#222e35] rounded-xl text-xs sm:text-sm text-[#e9edef] placeholder-[#8696a0] focus:outline-none focus:border-[#00a884]"
+              />
+              <p className="text-[10px] text-[#8696a0] px-1">
+                Optimized & cached globally via <strong>wsrv.nl</strong> with zero Cloudflare egress charges.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                disabled={isUploadingImage}
+                onClick={() => setSelectedImageFile(null)}
+                className="px-4 py-2 text-xs text-[#8696a0] hover:text-[#e9edef] disabled:opacity-40"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isUploadingImage}
+                onClick={handleSendImage}
+                className="px-5 py-2.5 bg-[#00a884] hover:bg-[#02906f] disabled:opacity-50 text-[#111b21] font-bold rounded-xl text-xs flex items-center gap-2 cursor-pointer shadow-lg shadow-[#00a884]/20"
+              >
+                {isUploadingImage ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span>Uploading...</span>
+                  </>
+                ) : (
+                  <>
+                    <Send className="w-3.5 h-3.5" />
+                    <span>Send Photo</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 7. Image Lightbox Modal */}
+      {lightboxUrl && (
+        <div
+          onClick={() => setLightboxUrl(null)}
+          className="fixed inset-0 bg-black/90 backdrop-blur-md flex items-center justify-center p-3 sm:p-6 z-50 animate-in fade-in duration-150"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="relative max-w-4xl w-full max-h-[90vh] flex flex-col items-center"
+          >
+            <div className="absolute top-2 right-2 flex items-center gap-2 z-10">
+              <a
+                href={getOptimizedImageUrl(lightboxUrl, 1600)}
+                target="_blank"
+                rel="noopener noreferrer"
+                download="photo.webp"
+                className="p-2 rounded-full bg-black/60 hover:bg-black/80 text-white backdrop-blur-sm transition-all"
+                title="Download original"
+              >
+                <Download className="w-4 h-4" />
+              </a>
+              <button
+                onClick={() => setLightboxUrl(null)}
+                className="p-2 rounded-full bg-black/60 hover:bg-black/80 text-white backdrop-blur-sm transition-all"
+                title="Close"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <img
+              src={getOptimizedImageUrl(lightboxUrl, 1600)}
+              alt="Full view"
+              className="max-w-full max-h-[85vh] object-contain rounded-xl shadow-2xl"
+            />
           </div>
         </div>
       )}
