@@ -168,6 +168,68 @@ export function MessagingApp({
     }
   }, [activeConv?.id])
 
+  const lastSyncTimeRef = useRef<number>(Date.now() - 3600000)
+
+  // Gentle, single-endpoint delta sync: runs every 8 seconds ONLY when the tab is actively visible.
+  // When tab is hidden/minimized or phone locked: 0 requests!
+  useEffect(() => {
+    let syncTimer: any = null
+
+    const runSync = async () => {
+      if (typeof document !== 'undefined' && document.hidden) return
+
+      try {
+        const convId = activeConvRef.current?.id || ''
+        const url = `/api/sync?since=${lastSyncTimeRef.current}&conversationId=${encodeURIComponent(convId)}`
+        const res = await fetch(url, { headers: getAuthHeaders() })
+        if (res.ok) {
+          const data = await res.json()
+          lastSyncTimeRef.current = data.serverTime || Date.now()
+
+          if (data.friendships && data.friendships.length > 0) {
+            setFriendships(data.friendships)
+          }
+
+          if (data.conversations && data.conversations.length > 0) {
+            setConversations(data.conversations)
+            if (activeConvRef.current) {
+              const updated = data.conversations.find((c: any) => c.id === activeConvRef.current?.id)
+              if (updated) {
+                setActiveConv((prev) => (prev ? { ...prev, status: updated.status } : updated))
+              }
+            }
+          }
+
+          if (data.newMessages && data.newMessages.length > 0) {
+            setMessages((prev) => {
+              const existingIds = new Set(prev.map((m) => m.id))
+              const toAdd = data.newMessages.filter((m: any) => !existingIds.has(m.id))
+              if (toAdd.length === 0) return prev
+              return [...prev, ...toAdd]
+            })
+            scrollToBottom('smooth')
+          }
+        }
+      } catch (e) {
+        console.warn('Sync error', e)
+      }
+    }
+
+    syncTimer = setInterval(runSync, 8000)
+
+    const handleVisibility = () => {
+      if (!document.hidden) {
+        runSync()
+      }
+    }
+    document.addEventListener('visibilitychange', handleVisibility)
+
+    return () => {
+      if (syncTimer) clearInterval(syncTimer)
+      document.removeEventListener('visibilitychange', handleVisibility)
+    }
+  }, [])
+
   const handleScroll = () => {
     const el = messagesContainerRef.current
     if (!el) return

@@ -518,6 +518,103 @@ app.get('/api/federation/friendships', async (c) => {
   return c.json({ friendships: list })
 })
 
+// Unified Low-Bandwidth Edge Delta-Sync (Single lightweight call for conversations, messages & friendships)
+app.get('/api/sync', async (c) => {
+  const since = parseInt(c.req.query('since') || '0', 10)
+  const conversationId = c.req.query('conversationId') || ''
+  const db = c.env?.DB
+
+  let newMessages: any[] = []
+  let friendships: any[] = []
+  let conversations: any[] = []
+
+  if (db) {
+    try {
+      await ensureD1Database(db)
+      if (conversationId) {
+        const msgRows: any = await db.prepare(
+          'SELECT * FROM messages WHERE conversation_id = ? AND created_at > ? ORDER BY created_at ASC LIMIT 50'
+        ).bind(conversationId, since).all()
+        if (msgRows?.results) {
+          newMessages = msgRows.results.map((r: any) => ({
+            id: r.id,
+            conversationId: r.conversation_id,
+            senderId: r.sender_id,
+            body: r.content,
+            createdAt: new Date(r.created_at).toISOString(),
+            readAt: r.read_at ? new Date(r.read_at).toISOString() : null,
+          }))
+        }
+      }
+
+      const fRows: any = await db.prepare('SELECT * FROM federation_friendships ORDER BY created_at DESC LIMIT 50').all()
+      if (fRows?.results) friendships = fRows.results
+
+      const cRows: any = await db.prepare('SELECT * FROM conversations ORDER BY last_message_at DESC LIMIT 50').all()
+      if (cRows?.results) {
+        conversations = cRows.results.map((row: any) => ({
+          id: row.id,
+          otherUser: {
+            id: row.user_b,
+            username: row.remote_handle || row.user_b,
+            displayName: row.remote_handle ? `@${row.remote_handle}` : row.user_b,
+          },
+          status: row.status,
+          remoteInstanceUrl: row.remote_instance_url || null,
+          lastMessage: row.last_message_snippet
+            ? { content: row.last_message_snippet, createdAt: row.last_message_at }
+            : null,
+        }))
+      }
+
+      return c.json({
+        serverTime: Date.now(),
+        newMessages,
+        friendships,
+        conversations,
+      })
+    } catch (e: any) {
+      console.warn('[Sync D1 Warning]', e?.message)
+    }
+  }
+
+  // In-memory fallback
+  const memMsgs = memoryStore.messages
+    .filter((m) => (!conversationId || m.conversation_id === conversationId) && m.created_at > since)
+    .map((m) => ({
+      id: m.id,
+      conversationId: m.conversation_id,
+      senderId: m.sender_id,
+      body: m.content,
+      createdAt: new Date(m.created_at).toISOString(),
+      readAt: m.read_at ? new Date(m.read_at).toISOString() : null,
+    }))
+
+  const memFriendships = Array.from(memoryStore.friendships.values()).sort((a, b) => b.created_at - a.created_at)
+  const memConvs = Array.from(memoryStore.conversations.values())
+    .sort((a, b) => b.last_message_at - a.last_message_at)
+    .map((conv) => ({
+      id: conv.id,
+      otherUser: {
+        id: conv.user_b,
+        username: conv.remote_handle || conv.user_b,
+        displayName: conv.remote_handle ? `@${conv.remote_handle}` : conv.user_b,
+      },
+      status: conv.status,
+      remoteInstanceUrl: conv.remote_instance_url || null,
+      lastMessage: conv.last_message_snippet
+        ? { content: conv.last_message_snippet, createdAt: conv.last_message_at }
+        : null,
+    }))
+
+  return c.json({
+    serverTime: Date.now(),
+    newMessages: memMsgs,
+    friendships: memFriendships,
+    conversations: memConvs,
+  })
+})
+
 // ============================================================================
 // 8. Send Friend Request (Outbound to Remote Peer Subdomain / Domain)
 // ============================================================================
