@@ -10,6 +10,7 @@ import {
   Sparkles,
   UserPlus,
   ArrowDown,
+  ArrowLeft,
   QrCode,
   X,
   Clock,
@@ -86,7 +87,6 @@ export function MessagingApp({
 
   // Stream state
   const [streamConnected, setStreamConnected] = useState(false)
-  const [lastStreamActivity, setLastStreamActivity] = useState(Date.now())
 
   // Scroll states
   const [showScrollBottom, setShowScrollBottom] = useState(false)
@@ -98,9 +98,18 @@ export function MessagingApp({
   const activeConvRef = useRef<Conversation | null>(null)
   activeConvRef.current = activeConv
 
+  const getAuthHeaders = (extra: Record<string, string> = {}) => {
+    const token = typeof window !== 'undefined' ? localStorage.getItem('chatze_auth_token') : null
+    return {
+      ...extra,
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    }
+  }
+
+  // Initial load only (Runs ONCE when component mounts)
   const loadConversations = async () => {
     try {
-      const res = await fetch('/api/conversations')
+      const res = await fetch('/api/conversations', { headers: getAuthHeaders() })
       if (res.ok) {
         const data = await res.json()
         if (data.conversations) {
@@ -120,7 +129,7 @@ export function MessagingApp({
 
   const loadFriendships = async () => {
     try {
-      const res = await fetch('/api/federation/friendships')
+      const res = await fetch('/api/federation/friendships', { headers: getAuthHeaders() })
       if (res.ok) {
         const data = await res.json()
         if (data.friendships) setFriendships(data.friendships)
@@ -132,7 +141,9 @@ export function MessagingApp({
 
   const loadMessages = async (convId: string) => {
     try {
-      const res = await fetch(`/api/messaging?conversationId=${encodeURIComponent(convId)}`)
+      const res = await fetch(`/api/messaging?conversationId=${encodeURIComponent(convId)}`, {
+        headers: getAuthHeaders(),
+      })
       if (res.ok) {
         const data = await res.json()
         if (data.messages) {
@@ -144,28 +155,18 @@ export function MessagingApp({
     }
   }
 
+  // Load initial dataset once on mount
   useEffect(() => {
     loadConversations()
     loadFriendships()
   }, [])
 
+  // Load message history only when switching active chat
   useEffect(() => {
     if (activeConv) {
       loadMessages(activeConv.id)
     }
   }, [activeConv?.id])
-
-  // Periodic 3-second sync across Cloudflare Worker isolates
-  useEffect(() => {
-    const syncInterval = setInterval(() => {
-      loadConversations()
-      loadFriendships()
-      if (activeConvRef.current && activeConvRef.current.status !== 'pending') {
-        loadMessages(activeConvRef.current.id)
-      }
-    }, 3000)
-    return () => clearInterval(syncInterval)
-  }, [])
 
   const handleScroll = () => {
     const el = messagesContainerRef.current
@@ -184,104 +185,178 @@ export function MessagingApp({
     setHasNewUnreadWhileScrolled(false)
   }
 
-  // SSE Stream
+  // ==========================================================================
+  // ZERO-POLLING SSE STREAM (Pure Event-Driven, Standard W3C Auto-Reconnect)
+  // Reconnects only once every ~95s when Cloudflare stream finishes cleanly.
+  // Zero requests/sec while idle!
+  // ==========================================================================
   useEffect(() => {
     let evtSource: EventSource | null = null
-    let watchdogTimer: NodeJS.Timeout | null = null
 
-    const connectStream = () => {
-      if (evtSource) evtSource.close()
-      try {
-        evtSource = new EventSource(`/api/stream?userId=${encodeURIComponent(currentUser.id)}`)
+    const initEventSource = () => {
+      if (evtSource) {
+        evtSource.close()
+      }
 
-        evtSource.addEventListener('connected', () => {
-          setStreamConnected(true)
-          setLastStreamActivity(Date.now())
-        })
+      evtSource = new EventSource(`/api/stream?userId=${encodeURIComponent(currentUser.id)}`)
 
-        evtSource.addEventListener('ping', () => {
-          setStreamConnected(true)
-          setLastStreamActivity(Date.now())
-        })
+      evtSource.onopen = () => {
+        setStreamConnected(true)
+      }
 
-        evtSource.addEventListener('new_message', (e) => {
-          setLastStreamActivity(Date.now())
-          try {
-            const incoming: ChatMessage = JSON.parse(e.data)
-            const currentActive = activeConvRef.current
+      evtSource.addEventListener('connected', () => {
+        setStreamConnected(true)
+      })
 
-            if (currentActive && incoming.conversationId === currentActive.id) {
-              setMessages((prev) => {
-                if (prev.some((m) => m.id === incoming.id)) return prev
-                return [...prev, incoming]
-              })
+      evtSource.addEventListener('ping', () => {
+        setStreamConnected(true)
+      })
 
-              const el = messagesContainerRef.current
-              const isScrolledUp = el && el.scrollHeight - el.scrollTop - el.clientHeight > 90
-              if (isScrolledUp) {
-                setHasNewUnreadWhileScrolled(true)
-              } else {
-                scrollToBottom('smooth')
+      // Inbound or outbound message: Update React state in-place (ZERO GET requests!)
+      evtSource.addEventListener('new_message', (e) => {
+        try {
+          const incoming: ChatMessage = JSON.parse(e.data)
+          const currentActive = activeConvRef.current
+
+          // 1. If currently in this conversation, append message to view
+          if (currentActive && incoming.conversationId === currentActive.id) {
+            setMessages((prev) => {
+              if (prev.some((m) => m.id === incoming.id || (m.body === incoming.body && m.status === 'sending'))) {
+                return prev.map((m) =>
+                  m.id === incoming.id || (m.body === incoming.body && m.status === 'sending')
+                    ? { ...incoming, status: 'sent' }
+                    : m
+                )
               }
+              return [...prev, incoming]
+            })
+
+            const el = messagesContainerRef.current
+            const isScrolledUp = el && el.scrollHeight - el.scrollTop - el.clientHeight > 90
+            if (isScrolledUp) {
+              setHasNewUnreadWhileScrolled(true)
+            } else {
+              scrollToBottom('smooth')
             }
-            loadConversations()
-          } catch (err) {
-            console.warn('SSE parse error', err)
           }
-        })
 
-        evtSource.addEventListener('incoming_friend_request', () => {
-          setLastStreamActivity(Date.now())
-          loadFriendships()
-          loadConversations()
-        })
-
-        evtSource.addEventListener('friend_accepted', () => {
-          setLastStreamActivity(Date.now())
-          loadFriendships()
-          loadConversations()
-          if (activeConvRef.current) {
-            loadMessages(activeConvRef.current.id)
-          }
-        })
-
-        evtSource.onerror = () => {
-          setStreamConnected(false)
-          evtSource?.close()
-          setTimeout(connectStream, 1500)
+          // 2. Update conversation snippet in memory without any HTTP network call!
+          setConversations((prev) => {
+            const index = prev.findIndex((c) => c.id === incoming.conversationId)
+            const msgTime = new Date(incoming.createdAt).getTime()
+            if (index !== -1) {
+              const updated = [...prev]
+              const conv = { ...updated[index] }
+              conv.lastMessage = { content: incoming.body, createdAt: msgTime }
+              updated.splice(index, 1)
+              return [conv, ...updated]
+            }
+            return prev
+          })
+        } catch (err) {
+          console.warn('SSE message parse error', err)
         }
-      } catch (err) {
+      })
+
+      // Inbound friend request: Update state in-place (ZERO GET requests!)
+      evtSource.addEventListener('incoming_friend_request', (e) => {
+        try {
+          const payload = JSON.parse(e.data)
+          const friendship = payload.friendship
+          if (friendship) {
+            setFriendships((prev) => {
+              if (prev.some((f) => f.id === friendship.id)) return prev
+              return [friendship, ...prev]
+            })
+          }
+          const cleanHandle = payload.from_handle
+          if (cleanHandle) {
+            setConversations((prev) => {
+              const convId = 'conv_' + cleanHandle
+              if (prev.some((c) => c.id === convId)) return prev
+              return [
+                {
+                  id: convId,
+                  otherUser: {
+                    username: cleanHandle,
+                    displayName: payload.from_display_name || `@${cleanHandle}`,
+                  },
+                  status: 'pending',
+                  remoteInstanceUrl: payload.from_instance_url || null,
+                  lastMessage: {
+                    content: `Connection request from @${cleanHandle}`,
+                    createdAt: Date.now(),
+                  },
+                },
+                ...prev,
+              ]
+            })
+          }
+        } catch (err) {
+          console.warn('SSE incoming friend parse error', err)
+        }
+      })
+
+      // Friend request accepted: Update state in-place (ZERO GET requests!)
+      evtSource.addEventListener('friend_accepted', (e) => {
+        try {
+          const payload = JSON.parse(e.data)
+          const cleanHandle = payload.remoteHandle
+          if (cleanHandle) {
+            setFriendships((prev) =>
+              prev.map((f) => (f.remote_handle === cleanHandle ? { ...f, status: 'active' } : f))
+            )
+            setConversations((prev) =>
+              prev.map((c) =>
+                c.otherUser.username === cleanHandle
+                  ? {
+                      ...c,
+                      status: 'active',
+                      lastMessage: { content: 'Connected! You can now message each other.', createdAt: Date.now() },
+                    }
+                  : c
+              )
+            );
+            if (activeConvRef.current && activeConvRef.current.otherUser.username === cleanHandle) {
+              setActiveConv((prev) => (prev ? { ...prev, status: 'active' } : prev))
+            }
+          }
+        } catch (err) {
+          console.warn('SSE friend accepted parse error', err)
+        }
+      })
+
+      evtSource.onerror = () => {
         setStreamConnected(false)
+        // Standard W3C EventSource handles reconnect natively without creating interval loops
       }
     }
 
-    connectStream()
+    initEventSource()
 
-    watchdogTimer = setInterval(() => {
-      if (Date.now() - lastStreamActivity > 15000) {
-        connectStream()
-      }
-    }, 5000)
-
+    // Gentle sync ONLY when returning to a hidden tab after device sleep/lock
     const handleVisibilityChange = () => {
-      if (!document.hidden && activeConvRef.current) {
-        loadMessages(activeConvRef.current.id)
+      if (!document.hidden) {
+        if (!evtSource || evtSource.readyState === EventSource.CLOSED) {
+          initEventSource()
+        }
         loadConversations()
         loadFriendships()
+        if (activeConvRef.current) {
+          loadMessages(activeConvRef.current.id)
+        }
       }
     }
-    window.addEventListener('visibilitychange', handleVisibilityChange)
-    window.addEventListener('focus', handleVisibilityChange)
+
+    document.addEventListener('visibilitychange', handleVisibilityChange)
 
     return () => {
-      evtSource?.close()
-      if (watchdogTimer) clearInterval(watchdogTimer)
-      window.removeEventListener('visibilitychange', handleVisibilityChange)
-      window.removeEventListener('focus', handleVisibilityChange)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+      if (evtSource) evtSource.close()
     }
   }, [currentUser.id])
 
-  // Send Contact Connection Request (Passes accurate origin & handle)
+  // Send Contact Connection Request (Single POST request)
   const handleSendFriendRequest = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!friendHandle.trim() || !friendDomain.trim()) return
@@ -292,7 +367,7 @@ export function MessagingApp({
     try {
       const res = await fetch('/api/federation/requests', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           remoteHandle: friendHandle.trim(),
           remoteInstanceUrl: friendDomain.trim(),
@@ -307,10 +382,12 @@ export function MessagingApp({
         setFriendHandle('')
         setFriendDomain('')
         setShowAddFriendModal(false)
-        await loadConversations()
-        await loadFriendships()
+
+        if (data.friendship) {
+          setFriendships((prev) => [data.friendship, ...prev.filter((f) => f.id !== data.friendship.id)])
+        }
         if (data.conversation) {
-          setActiveConv({
+          const newConv: Conversation = {
             id: data.conversation.id,
             otherUser: {
               id: data.conversation.user_b,
@@ -320,7 +397,9 @@ export function MessagingApp({
             status: 'pending',
             remoteInstanceUrl: data.conversation.remote_instance_url,
             lastMessage: { content: data.conversation.last_message_snippet, createdAt: Date.now() },
-          })
+          }
+          setConversations((prev) => [newConv, ...prev.filter((c) => c.id !== newConv.id)])
+          setActiveConv(newConv)
         }
       } else {
         setAddFriendError(data.error || 'Failed to send request')
@@ -332,45 +411,52 @@ export function MessagingApp({
     }
   }
 
-  // Accept Inbound Request
+  // Accept Inbound Request (Single POST request)
   const handleAcceptFriendRequest = async (remoteHandle: string, remoteInstanceUrl: string) => {
     try {
-      const res = await fetch('/api/federation/requests/accept', {
+      // Optimistic update in memory
+      setFriendships((prev) =>
+        prev.map((f) => (f.remote_handle === remoteHandle ? { ...f, status: 'active' } : f))
+      )
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.otherUser.username === remoteHandle
+            ? { ...c, status: 'active', lastMessage: { content: 'Connected! You can now message each other.', createdAt: Date.now() } }
+            : c
+        )
+      )
+
+      await fetch('/api/federation/requests/accept', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           remoteHandle,
           remoteInstanceUrl,
           myHandle: currentUser.handle,
         }),
       })
-      if (res.ok) {
-        await loadFriendships()
-        await loadConversations()
-      }
     } catch (err) {
       console.error('Accept error', err)
     }
   }
 
-  // Decline Inbound Request
+  // Decline Inbound Request (Single POST request)
   const handleRejectFriendRequest = async (remoteHandle: string) => {
     try {
-      const res = await fetch('/api/federation/requests/reject', {
+      setFriendships((prev) => prev.filter((f) => f.remote_handle !== remoteHandle))
+      setConversations((prev) => prev.filter((c) => c.otherUser.username !== remoteHandle))
+
+      await fetch('/api/federation/requests/reject', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ remoteHandle }),
       })
-      if (res.ok) {
-        await loadFriendships()
-        await loadConversations()
-      }
     } catch (err) {
       console.error('Reject error', err)
     }
   }
 
-  // Send Message (0ms Optimistic + Background Cross-Peer Forwarding)
+  // Send Message (0ms Optimistic + Single POST request, ZERO GET requests!)
   const handleSendMessage = async (e?: React.FormEvent, customText?: string) => {
     if (e) e.preventDefault()
     const textToSend = customText || inputText.trim()
@@ -391,10 +477,23 @@ export function MessagingApp({
     if (!customText) setInputText('')
     scrollToBottom('instant')
 
+    // Optimistically update conversation snippet in sidebar in 0ms!
+    setConversations((prev) => {
+      const index = prev.findIndex((c) => c.id === activeConv.id)
+      if (index !== -1) {
+        const updated = [...prev]
+        const conv = { ...updated[index] }
+        conv.lastMessage = { content: textToSend, createdAt: Date.now() }
+        updated.splice(index, 1)
+        return [conv, ...updated]
+      }
+      return prev
+    })
+
     try {
       const res = await fetch('/api/messaging', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           conversationId: activeConv.id,
           body: textToSend,
@@ -411,7 +510,6 @@ export function MessagingApp({
           prev.map((m) => (m.id === tempId ? { ...data.message, status: 'sent' } : m))
         )
       }
-      loadConversations()
     } catch (err) {
       console.error('Failed to send message', err)
     }
@@ -435,17 +533,21 @@ export function MessagingApp({
 
   return (
     <div className="flex h-screen w-full bg-[#0b141a] text-[#e9edef] overflow-hidden font-sans select-none">
-      {/* 1. Left Sidebar: WhatsApp Style Chats Queue */}
-      <aside className="w-80 sm:w-96 border-r border-[#202c33] bg-[#111b21] flex flex-col shrink-0">
+      {/* 1. Sidebar: Full width on mobile when no active chat, 80-96 width on desktop */}
+      <aside
+        className={`${
+          activeConv ? 'hidden md:flex' : 'flex'
+        } w-full md:w-80 lg:w-96 border-r border-[#202c33] bg-[#111b21] flex-col shrink-0 h-full`}
+      >
         {/* Header Bar */}
         <div className="p-3.5 border-b border-[#202c33] space-y-3 bg-[#202c33]/40">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2.5">
-              <div className="w-9 h-9 rounded-full bg-[#00a884]/20 border border-[#00a884]/30 flex items-center justify-center font-bold text-xs text-[#00a884]">
+              <div className="w-10 h-10 rounded-full bg-[#00a884]/20 border border-[#00a884]/30 flex items-center justify-center font-bold text-xs text-[#00a884] shrink-0">
                 {currentUser.display_name.slice(0, 2).toUpperCase()}
               </div>
               <div className="min-w-0">
-                <h1 className="text-sm font-semibold text-[#e9edef] leading-tight truncate max-w-[150px]">
+                <h1 className="text-sm font-semibold text-[#e9edef] leading-tight truncate max-w-[140px] sm:max-w-[180px]">
                   {businessName || currentUser.display_name}
                 </h1>
                 <div className="flex items-center gap-1.5 text-[11px] text-[#8696a0]">
@@ -472,7 +574,7 @@ export function MessagingApp({
               </button>
               <button
                 onClick={onLogout}
-                title="Logout"
+                title="Lock / Logout"
                 className="p-2 rounded-full text-[#8696a0] hover:text-rose-400 hover:bg-[#202c33] transition-colors"
               >
                 <LogOut className="w-4 h-4" />
@@ -483,7 +585,7 @@ export function MessagingApp({
           {/* Connect Contact Button */}
           <button
             onClick={() => setShowAddFriendModal(true)}
-            className="w-full py-2 px-3 bg-[#00a884] hover:bg-[#02906f] text-[#111b21] rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition-all shadow-md shadow-[#00a884]/20 cursor-pointer"
+            className="w-full py-2.5 px-3 bg-[#00a884] hover:bg-[#02906f] text-[#111b21] rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition-all shadow-md shadow-[#00a884]/20 cursor-pointer"
           >
             <UserPlus className="w-4 h-4" /> + Connect Contact (Subdomain / Domain)
           </button>
@@ -548,13 +650,13 @@ export function MessagingApp({
                 <div className="flex items-center gap-2">
                   <button
                     onClick={() => handleAcceptFriendRequest(req.remote_handle, req.remote_instance_url)}
-                    className="flex-1 py-1 bg-[#00a884] hover:bg-[#02906f] text-[#111b21] font-bold rounded-lg text-[11px] transition-all cursor-pointer"
+                    className="flex-1 py-1.5 bg-[#00a884] hover:bg-[#02906f] text-[#111b21] font-bold rounded-lg text-xs transition-all cursor-pointer"
                   >
                     Accept
                   </button>
                   <button
                     onClick={() => handleRejectFriendRequest(req.remote_handle)}
-                    className="px-3 py-1 bg-[#202c33] hover:bg-[#222e35] text-[#8696a0] rounded-lg text-[11px] transition-all cursor-pointer"
+                    className="px-3 py-1.5 bg-[#202c33] hover:bg-[#222e35] text-[#8696a0] rounded-lg text-xs transition-all cursor-pointer"
                   >
                     Decline
                   </button>
@@ -620,30 +722,43 @@ export function MessagingApp({
         </div>
       </aside>
 
-      {/* 2. Main Chat Panel (WhatsApp Chat View) */}
-      <main className="flex-1 flex flex-col bg-[#0b141a] min-w-0 relative">
+      {/* 2. Main Chat Panel: Full width on mobile when chat is active, hidden when back to list */}
+      <main
+        className={`${
+          !activeConv ? 'hidden md:flex' : 'flex'
+        } flex-1 flex-col bg-[#0b141a] min-w-0 relative w-full h-full`}
+      >
         {activeConv ? (
           <>
-            {/* Active Header */}
-            <div className="h-16 px-5 border-b border-[#202c33] flex items-center justify-between bg-[#202c33]/70 shrink-0 backdrop-blur-sm">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-full bg-[#111b21] border border-[#222e35] flex items-center justify-center font-bold text-xs text-[#00a884]">
+            {/* Active Header (With Mobile Back Button) */}
+            <div className="h-16 px-3 sm:px-5 border-b border-[#202c33] flex items-center justify-between bg-[#202c33]/70 shrink-0 backdrop-blur-sm">
+              <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+                {/* Back button on mobile */}
+                <button
+                  onClick={() => setActiveConv(null)}
+                  className="md:hidden p-2 -ml-1 text-[#8696a0] hover:text-[#e9edef] rounded-full hover:bg-[#202c33] transition-colors shrink-0"
+                  title="Back to all chats"
+                >
+                  <ArrowLeft className="w-5 h-5" />
+                </button>
+
+                <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-full bg-[#111b21] border border-[#222e35] flex items-center justify-center font-bold text-xs text-[#00a884] shrink-0">
                   {activeConv.otherUser.displayName.slice(0, 2).toUpperCase()}
                 </div>
-                <div>
-                  <h2 className="text-sm font-semibold text-[#e9edef] flex items-center gap-2">
-                    {activeConv.otherUser.displayName}
+                <div className="min-w-0">
+                  <h2 className="text-xs sm:text-sm font-semibold text-[#e9edef] flex items-center gap-1.5 truncate">
+                    <span className="truncate">{activeConv.otherUser.displayName}</span>
                     {activeConv.status === 'pending' ? (
-                      <span className="px-2 py-0.5 rounded-full text-[10px] font-normal bg-amber-500/10 text-amber-400 border border-amber-500/20">
-                        Waiting for Approval
+                      <span className="px-1.5 py-0.5 rounded-full text-[9px] sm:text-[10px] font-normal bg-amber-500/10 text-amber-400 border border-amber-500/20 shrink-0">
+                        Pending
                       </span>
                     ) : (
-                      <span className="px-2 py-0.5 rounded-full text-[10px] font-normal bg-[#00a884]/10 text-[#00a884] border border-[#00a884]/20">
+                      <span className="px-1.5 py-0.5 rounded-full text-[9px] sm:text-[10px] font-normal bg-[#00a884]/10 text-[#00a884] border border-[#00a884]/20 shrink-0">
                         Online
                       </span>
                     )}
                   </h2>
-                  <p className="text-xs text-[#8696a0]">
+                  <p className="text-[11px] text-[#8696a0] truncate">
                     {activeConv.remoteInstanceUrl
                       ? activeConv.remoteInstanceUrl.replace(/^https?:\/\//, '')
                       : `@${activeConv.otherUser.username}`}
@@ -651,24 +766,24 @@ export function MessagingApp({
                 </div>
               </div>
 
-              <div className="flex items-center gap-2 text-xs text-[#8696a0]">
-                <span className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#111b21] border border-[#202c33] text-[11px]">
+              <div className="flex items-center gap-2 text-xs text-[#8696a0] shrink-0">
+                <span className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1 rounded-full bg-[#111b21] border border-[#202c33] text-[10px] sm:text-[11px]">
                   <span className={`w-2 h-2 rounded-full ${streamConnected ? 'bg-[#00a884]' : 'bg-amber-400 animate-ping'}`} />
-                  {streamConnected ? '100s SSE Live' : 'Reconnecting...'}
+                  <span className="hidden sm:inline">{streamConnected ? '100s SSE Live' : 'Reconnecting...'}</span>
                 </span>
               </div>
             </div>
 
             {/* Conversation Messages OR Pending Screen */}
             {activeConv.status === 'pending' ? (
-              <div className="flex-1 flex flex-col items-center justify-center p-8 text-center space-y-4 max-w-md mx-auto">
+              <div className="flex-1 flex flex-col items-center justify-center p-6 sm:p-8 text-center space-y-4 max-w-md mx-auto">
                 <div className="p-4 rounded-3xl bg-amber-500/10 border border-amber-500/20 text-amber-400">
-                  <Clock className="w-12 h-12 animate-pulse" />
+                  <Clock className="w-10 h-10 sm:w-12 sm:h-12 animate-pulse" />
                 </div>
-                <h3 className="text-lg font-bold text-[#e9edef]">Connection Request Pending</h3>
+                <h3 className="text-base sm:text-lg font-bold text-[#e9edef]">Connection Request Pending</h3>
                 <p className="text-xs text-[#8696a0] leading-relaxed">
                   You sent a connection request to <strong className="text-[#e9edef]">@{activeConv.otherUser.username}</strong> on{' '}
-                  <span className="text-[#00a884] font-mono">{activeConv.remoteInstanceUrl || 'their instance'}</span>.
+                  <span className="text-[#00a884] font-mono break-all">{activeConv.remoteInstanceUrl || 'their instance'}</span>.
                 </p>
                 <div className="p-3 bg-[#111b21] border border-[#202c33] rounded-xl text-[11px] text-[#8696a0] text-left space-y-1 w-full">
                   <p className="text-[#e9edef] font-medium flex items-center gap-1.5">
@@ -679,7 +794,7 @@ export function MessagingApp({
                 </div>
 
                 <div className="flex items-center justify-center gap-2 text-xs text-amber-400/90 font-medium bg-amber-500/10 border border-amber-500/20 py-2.5 px-4 rounded-xl w-full">
-                  <Clock className="w-4 h-4 animate-spin text-amber-400" />
+                  <Clock className="w-4 h-4 animate-spin text-amber-400 shrink-0" />
                   <span>Waiting for @{activeConv.otherUser.username} to accept your request...</span>
                 </div>
               </div>
@@ -687,24 +802,22 @@ export function MessagingApp({
               <div
                 ref={messagesContainerRef}
                 onScroll={handleScroll}
-                className="flex-1 overflow-y-auto p-6 space-y-3 min-h-0 bg-[#0b141a]"
+                className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-3 min-h-0 bg-[#0b141a]"
               >
                 {messages.map((msg) => {
                   const isMe = msg.senderId === currentUser.id
                   return (
                     <div key={msg.id} className={`flex ${isMe ? 'justify-end' : 'justify-start'}`}>
                       <div
-                        className={`max-w-[75%] rounded-2xl px-4 py-2 text-sm shadow-sm transition-all ${
+                        className={`max-w-[85%] sm:max-w-[75%] rounded-2xl px-3.5 sm:px-4 py-2 text-sm shadow-sm transition-all ${
                           isMe
                             ? 'bg-[#005c4b] text-[#e9edef] rounded-br-none'
                             : 'bg-[#202c33] text-[#e9edef] rounded-bl-none'
                         }`}
                       >
-                        <p className="break-words leading-relaxed">{msg.body}</p>
+                        <p className="break-words leading-relaxed text-[13px] sm:text-sm">{msg.body}</p>
                         <div
-                          className={`flex items-center justify-end gap-1 mt-1 text-[10px] ${
-                            isMe ? 'text-[#8696a0]' : 'text-[#8696a0]'
-                          }`}
+                          className={`flex items-center justify-end gap-1 mt-1 text-[10px] text-[#8696a0]`}
                         >
                           <span>
                             {new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
@@ -729,7 +842,7 @@ export function MessagingApp({
             {showScrollBottom && (
               <button
                 onClick={() => scrollToBottom('smooth')}
-                className="absolute bottom-24 right-8 p-3 rounded-full bg-[#202c33] border border-[#222e35] text-[#00a884] shadow-xl hover:bg-[#2a3942] transition-all flex items-center gap-1.5 text-xs cursor-pointer z-20"
+                className="absolute bottom-24 right-4 sm:right-8 p-3 rounded-full bg-[#202c33] border border-[#222e35] text-[#00a884] shadow-xl hover:bg-[#2a3942] transition-all flex items-center gap-1.5 text-xs cursor-pointer z-20"
               >
                 <ArrowDown className="w-4 h-4" />
                 {hasNewUnreadWhileScrolled && (
@@ -742,8 +855,8 @@ export function MessagingApp({
 
             {/* Quick Replies Bar */}
             {activeConv.status !== 'pending' && (
-              <div className="px-5 py-2 border-t border-[#202c33] bg-[#111b21]/70 flex items-center gap-2 overflow-x-auto no-scrollbar shrink-0">
-                <span className="text-[11px] font-semibold text-[#8696a0] uppercase tracking-wider shrink-0 flex items-center gap-1">
+              <div className="px-3 sm:px-5 py-2 border-t border-[#202c33] bg-[#111b21]/70 flex items-center gap-2 overflow-x-auto no-scrollbar shrink-0">
+                <span className="text-[10px] sm:text-[11px] font-semibold text-[#8696a0] uppercase tracking-wider shrink-0 flex items-center gap-1">
                   <Sparkles className="w-3 h-3 text-[#00a884]" /> Quick:
                 </span>
                 {UNIVERSAL_QUICK_REPLIES.map((reply, i) => (
@@ -751,7 +864,7 @@ export function MessagingApp({
                     key={i}
                     type="button"
                     onClick={() => handleSendMessage(undefined, reply.text)}
-                    className="px-3 py-1 bg-[#202c33] hover:bg-[#2a3942] border border-[#222e35] rounded-full text-xs text-[#e9edef] whitespace-nowrap transition-colors shrink-0 cursor-pointer"
+                    className="px-2.5 sm:px-3 py-1 bg-[#202c33] hover:bg-[#2a3942] border border-[#222e35] rounded-full text-[11px] sm:text-xs text-[#e9edef] whitespace-nowrap transition-colors shrink-0 cursor-pointer"
                   >
                     {reply.label}
                   </button>
@@ -762,7 +875,7 @@ export function MessagingApp({
             {/* Input Composer Bar */}
             <form
               onSubmit={handleSendMessage}
-              className="p-3.5 border-t border-[#202c33] bg-[#202c33]/50 flex items-center gap-3 shrink-0"
+              className="p-2.5 sm:p-3.5 border-t border-[#202c33] bg-[#202c33]/50 flex items-center gap-2 sm:gap-3 shrink-0"
             >
               <input
                 type="text"
@@ -771,24 +884,24 @@ export function MessagingApp({
                 onChange={(e) => setInputText(e.target.value)}
                 placeholder={
                   activeConv.status === 'pending'
-                    ? 'Waiting for contact to approve connection request...'
+                    ? 'Waiting for contact to approve...'
                     : 'Type a message (Enter to send)...'
                 }
-                className="flex-1 bg-[#2a3942] border border-[#222e35] rounded-xl px-4 py-2.5 text-sm text-[#e9edef] placeholder-[#8696a0] focus:outline-none focus:border-[#00a884] disabled:opacity-40 transition-all"
+                className="flex-1 bg-[#2a3942] border border-[#222e35] rounded-xl px-3 sm:px-4 py-2 sm:py-2.5 text-xs sm:text-sm text-[#e9edef] placeholder-[#8696a0] focus:outline-none focus:border-[#00a884] disabled:opacity-40 transition-all"
               />
               <button
                 type="submit"
                 disabled={activeConv.status === 'pending' || !inputText.trim()}
-                className="p-2.5 bg-[#00a884] hover:bg-[#02906f] disabled:opacity-40 text-[#111b21] font-bold rounded-xl transition-all shadow-md shadow-[#00a884]/20 cursor-pointer"
+                className="p-2.5 bg-[#00a884] hover:bg-[#02906f] disabled:opacity-40 text-[#111b21] font-bold rounded-xl transition-all shadow-md shadow-[#00a884]/20 cursor-pointer shrink-0"
               >
-                <Send className="w-5 h-5" />
+                <Send className="w-4 h-4 sm:w-5 sm:h-5" />
               </button>
             </form>
           </>
         ) : (
-          <div className="flex-1 flex flex-col items-center justify-center text-center p-8 space-y-4 max-w-sm mx-auto">
+          <div className="flex-1 flex flex-col items-center justify-center text-center p-6 sm:p-8 space-y-4 max-w-sm mx-auto">
             <div className="p-4 rounded-3xl bg-[#111b21] border border-[#202c33] text-[#8696a0]">
-              <MessageSquare className="w-12 h-12 text-[#00a884]" />
+              <MessageSquare className="w-10 h-10 sm:w-12 sm:h-12 text-[#00a884]" />
             </div>
             <h3 className="text-base font-bold text-[#e9edef]">Independent WhatsApp at Edge</h3>
             <p className="text-xs text-[#8696a0] leading-relaxed">
@@ -806,14 +919,14 @@ export function MessagingApp({
 
       {/* 3. Connect Contact Modal */}
       {showAddFriendModal && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50 animate-in fade-in duration-150">
-          <div className="max-w-md w-full bg-[#111b21] border border-[#202c33] rounded-2xl p-6 shadow-2xl space-y-5">
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4 z-50 animate-in fade-in duration-150">
+          <div className="max-w-md w-full bg-[#111b21] border border-[#202c33] rounded-2xl p-5 sm:p-6 shadow-2xl space-y-4 sm:space-y-5 max-h-[90vh] overflow-y-auto">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2.5">
                 <div className="p-2 rounded-xl bg-[#00a884]/10 border border-[#00a884]/20 text-[#00a884]">
                   <UserPlus className="w-5 h-5" />
                 </div>
-                <h3 className="text-base font-bold text-[#e9edef]">Connect Contact Instance</h3>
+                <h3 className="text-sm sm:text-base font-bold text-[#e9edef]">Connect Contact Instance</h3>
               </div>
               <button onClick={() => setShowAddFriendModal(false)} className="text-[#8696a0] hover:text-[#e9edef]">
                 <X className="w-5 h-5" />
@@ -842,7 +955,7 @@ export function MessagingApp({
                     value={friendHandle}
                     onChange={(e) => setFriendHandle(e.target.value)}
                     placeholder="e.g. suraj or alice"
-                    className="w-full pl-8 pr-3.5 py-2.5 bg-[#202c33] border border-[#222e35] rounded-xl text-sm text-[#e9edef] focus:outline-none focus:border-[#00a884]"
+                    className="w-full pl-8 pr-3.5 py-2.5 bg-[#202c33] border border-[#222e35] rounded-xl text-xs sm:text-sm text-[#e9edef] focus:outline-none focus:border-[#00a884]"
                   />
                 </div>
               </div>
@@ -857,7 +970,7 @@ export function MessagingApp({
                     value={friendDomain}
                     onChange={(e) => setFriendDomain(e.target.value)}
                     placeholder="e.g. chat-web-cfopou.askme50962.workers.dev"
-                    className="w-full pl-10 pr-3.5 py-2.5 bg-[#202c33] border border-[#222e35] rounded-xl text-sm text-[#e9edef] focus:outline-none focus:border-[#00a884]"
+                    className="w-full pl-10 pr-3.5 py-2.5 bg-[#202c33] border border-[#222e35] rounded-xl text-xs sm:text-sm text-[#e9edef] focus:outline-none focus:border-[#00a884]"
                   />
                 </div>
                 <p className="text-[10px] text-[#8696a0] pl-1">
@@ -888,14 +1001,14 @@ export function MessagingApp({
 
       {/* 4. My Instance Address Modal */}
       {showIdentityModal && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-          <div className="max-w-md w-full bg-[#111b21] border border-[#202c33] rounded-2xl p-6 shadow-2xl space-y-5">
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4 z-50">
+          <div className="max-w-md w-full bg-[#111b21] border border-[#202c33] rounded-2xl p-5 sm:p-6 shadow-2xl space-y-4 sm:space-y-5 max-h-[90vh] overflow-y-auto">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2.5">
                 <div className="p-2 rounded-xl bg-[#00a884]/10 border border-[#00a884]/20 text-[#00a884]">
                   <Share2 className="w-5 h-5" />
                 </div>
-                <h3 className="text-base font-bold text-[#e9edef]">Your Chatze Address</h3>
+                <h3 className="text-sm sm:text-base font-bold text-[#e9edef]">Your Chatze Address</h3>
               </div>
               <button onClick={() => setShowIdentityModal(false)} className="text-[#8696a0] hover:text-[#e9edef]">
                 <X className="w-5 h-5" />
@@ -937,19 +1050,19 @@ export function MessagingApp({
 
       {/* 5. Payment QR Modal */}
       {showQrModal && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-          <div className="max-w-xs w-full bg-[#111b21] border border-[#202c33] rounded-2xl p-6 text-center space-y-4 shadow-2xl">
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4 z-50">
+          <div className="max-w-xs w-full bg-[#111b21] border border-[#202c33] rounded-2xl p-5 sm:p-6 text-center space-y-4 shadow-2xl">
             <div className="flex items-center justify-between">
               <span className="text-xs font-bold text-[#00a884] uppercase tracking-wider">
                 Fonepay & eSewa QR
               </span>
               <button onClick={() => setShowQrModal(false)} className="text-[#8696a0] hover:text-[#e9edef]">
-                <X className="w-4 h-4" />
+                <X className="w-5 h-5" />
               </button>
             </div>
 
-            <div className="p-4 bg-white rounded-xl mx-auto w-48 h-48 flex items-center justify-center">
-              <QrCode className="w-40 h-40 text-slate-950" />
+            <div className="p-4 bg-white rounded-xl mx-auto w-44 h-44 sm:w-48 sm:h-48 flex items-center justify-center">
+              <QrCode className="w-36 h-36 sm:w-40 sm:h-40 text-slate-950" />
             </div>
 
             <div className="space-y-1 text-xs">

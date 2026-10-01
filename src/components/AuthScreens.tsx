@@ -1,7 +1,7 @@
 import React, { useState } from 'react'
 import { MessageSquare, Lock, ArrowRight } from 'lucide-react'
 
-export function AuthScreens({ onLoginSuccess }: { onLoginSuccess: (user: any) => void }) {
+export function AuthScreens({ onLoginSuccess }: { onLoginSuccess: (user: any, token?: string) => void }) {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
@@ -20,7 +20,7 @@ export function AuthScreens({ onLoginSuccess }: { onLoginSuccess: (user: any) =>
       })
       const data = await res.json()
       if (res.ok && data.user) {
-        onLoginSuccess(data.user)
+        onLoginSuccess(data.user, data.token)
       } else {
         setError(data.error || 'Incorrect username or password')
       }

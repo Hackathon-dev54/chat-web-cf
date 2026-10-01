@@ -23,29 +23,57 @@ export function App() {
           setSetupRequired(false)
           if (setupData.displayName) setDisplayName(setupData.displayName)
         } else {
-          // If uninitialized or database error, show setup wizard
           setSetupRequired(true)
           setLoading(false)
           return
         }
 
-        // Check session
-        const sessionRes = await fetch('/api/auth/session')
+        // Check device token in localStorage
+        const storedToken = localStorage.getItem('chatze_auth_token')
+        if (!storedToken) {
+          // Device has not logged in -> must enter password
+          setCurrentUser(null)
+          setLoading(false)
+          return
+        }
+
+        const sessionRes = await fetch('/api/auth/session', {
+          headers: {
+            Authorization: `Bearer ${storedToken}`,
+          },
+        })
         if (sessionRes.ok) {
           const sessionData = await sessionRes.json()
           if (sessionData.user) {
             setCurrentUser(sessionData.user)
+          } else {
+            localStorage.removeItem('chatze_auth_token')
+            setCurrentUser(null)
           }
+        } else {
+          localStorage.removeItem('chatze_auth_token')
+          setCurrentUser(null)
         }
       } catch (err) {
-        console.warn('App init status check, defaulting to setup wizard', err)
-        setSetupRequired(true)
+        console.warn('App init status check error', err)
       } finally {
         setLoading(false)
       }
     }
     checkState()
   }, [])
+
+  const handleLogout = async () => {
+    const token = localStorage.getItem('chatze_auth_token')
+    if (token) {
+      fetch('/api/auth/sign-out', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      }).catch(() => {})
+      localStorage.removeItem('chatze_auth_token')
+    }
+    setCurrentUser(null)
+  }
 
   if (loading) {
     return (
@@ -59,7 +87,8 @@ export function App() {
   if (setupRequired) {
     return (
       <SetupWizard
-        onComplete={(name, handle) => {
+        onComplete={(name, handle, token) => {
+          if (token) localStorage.setItem('chatze_auth_token', token)
           setDisplayName(name)
           setSetupRequired(false)
           setCurrentUser({
@@ -74,14 +103,21 @@ export function App() {
   }
 
   if (!currentUser) {
-    return <AuthScreens onLoginSuccess={(user) => setCurrentUser(user)} />
+    return (
+      <AuthScreens
+        onLoginSuccess={(user, token) => {
+          if (token) localStorage.setItem('chatze_auth_token', token)
+          setCurrentUser(user)
+        }}
+      />
+    )
   }
 
   return (
     <MessagingApp
       currentUser={currentUser}
       businessName={displayName}
-      onLogout={() => setCurrentUser(null)}
+      onLogout={handleLogout}
     />
   )
 }

@@ -69,6 +69,12 @@ interface MemUser {
   created_at: number
 }
 
+interface MemSession {
+  userId: string
+  createdAt: number
+  expiresAt: number
+}
+
 interface MemConversation {
   id: string
   user_a: string
@@ -101,10 +107,67 @@ interface MemFriendship {
 
 const memoryStore = {
   users: new Map<string, MemUser>(),
+  sessions: new Map<string, MemSession>(),
   conversations: new Map<string, MemConversation>(),
   messages: [] as MemMessage[],
   config: new Map<string, string>(),
   friendships: new Map<string, MemFriendship>(),
+}
+
+// Session expiration: 30 days
+const SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000
+
+async function createSession(userId: string, db?: any): Promise<string> {
+  const token = 'tok_' + crypto.randomUUID().replace(/-/g, '')
+  const now = Date.now()
+  const expiresAt = now + SESSION_DURATION_MS
+
+  memoryStore.sessions.set(token, { userId, createdAt: now, expiresAt })
+
+  if (db) {
+    try {
+      await ensureD1Database(db)
+      await db.prepare('INSERT OR REPLACE INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)')
+        .bind(token, userId, now, expiresAt).run()
+    } catch (e: any) {
+      console.warn('[Session Save Warning]', e?.message)
+    }
+  }
+
+  return token
+}
+
+async function validateSession(token: string, db?: any): Promise<any | null> {
+  if (!token) return null
+  const now = Date.now()
+
+  if (db) {
+    try {
+      await ensureD1Database(db)
+      const row: any = await db.prepare(`
+        SELECT u.id, u.handle, u.display_name, u.role, u.created_at
+        FROM sessions s
+        JOIN users u ON s.user_id = u.id
+        WHERE s.token = ? AND s.expires_at > ?
+        LIMIT 1
+      `).bind(token, now).first()
+
+      if (row) return row
+    } catch (e: any) {
+      console.warn('[Session Validate Warning]', e?.message)
+    }
+  }
+
+  const memSession = memoryStore.sessions.get(token)
+  if (memSession && memSession.expiresAt > now) {
+    const user = memoryStore.users.get(memSession.userId)
+    if (user) {
+      const { password_hash, ...safe } = user
+      return safe
+    }
+  }
+
+  return null
 }
 
 // ============================================================================
@@ -184,12 +247,14 @@ let d1Initialized = false
 const D1_INIT_STATEMENTS = [
   'CREATE TABLE IF NOT EXISTS system_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
   'CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL, password_hash TEXT NOT NULL, role TEXT DEFAULT "admin", created_at INTEGER NOT NULL)',
+  'CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)',
   'CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, user_a TEXT NOT NULL, user_b TEXT NOT NULL, remote_handle TEXT, remote_instance_url TEXT, last_message_snippet TEXT, last_message_at INTEGER NOT NULL, status TEXT DEFAULT "active")',
   'CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, sender_id TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL, read_at INTEGER)',
   'CREATE TABLE IF NOT EXISTS federation_friendships (id TEXT PRIMARY KEY, local_user_id TEXT NOT NULL, remote_handle TEXT NOT NULL, remote_instance_url TEXT NOT NULL, status TEXT DEFAULT "pending", direction TEXT DEFAULT "outgoing", created_at INTEGER NOT NULL)',
   'CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conversation_id, created_at DESC)',
   'CREATE INDEX IF NOT EXISTS idx_conversations_user_a ON conversations(user_a, last_message_at DESC)',
-  'CREATE INDEX IF NOT EXISTS idx_conversations_user_b ON conversations(user_b, last_message_at DESC)'
+  'CREATE INDEX IF NOT EXISTS idx_conversations_user_b ON conversations(user_b, last_message_at DESC)',
+  'CREATE INDEX IF NOT EXISTS idx_sessions_token_expires ON sessions(token, expires_at)'
 ]
 
 async function ensureD1Database(db: any) {
@@ -284,8 +349,11 @@ app.post('/api/setup', async (c) => {
       }
     }
 
+    const sessionToken = await createSession(adminId, db)
+
     return c.json({
       success: true,
+      token: sessionToken,
       user: {
         id: adminId,
         handle: cleanHandle,
@@ -299,27 +367,22 @@ app.post('/api/setup', async (c) => {
 })
 
 // ============================================================================
-// 6. Admin Sign In (Only for the owner of this deployed instance)
+// 6. Device-Secured Admin Sign In & Session Validation
 // ============================================================================
 app.get('/api/auth/session', async (c) => {
-  const db = c.env?.DB
+  const authHeader = c.req.header('Authorization') || ''
+  const token = authHeader.replace(/^Bearer\s+/i, '').trim()
 
-  if (db) {
-    try {
-      await ensureD1Database(db)
-      const admin: any = await db.prepare("SELECT id, handle, display_name, role, created_at FROM users WHERE role = 'admin' LIMIT 1").first()
-      if (admin) return c.json({ user: admin })
-    } catch (d1Err: any) {
-      console.warn('[D1 Session Warning]', d1Err?.message)
-    }
+  if (!token) {
+    return c.json({ user: null, error: 'Unauthorized: No session token provided' }, 401)
   }
 
-  const firstAdmin = Array.from(memoryStore.users.values()).find((u) => u.role === 'admin') || Array.from(memoryStore.users.values())[0]
-  if (firstAdmin) {
-    const { password_hash, ...safe } = firstAdmin
-    return c.json({ user: safe })
+  const user = await validateSession(token, c.env?.DB)
+  if (user) {
+    return c.json({ user })
   }
-  return c.json({ user: null }, 401)
+
+  return c.json({ user: null, error: 'Unauthorized: Session invalid or expired' }, 401)
 })
 
 app.post('/api/auth/sign-in', async (c) => {
@@ -327,30 +390,49 @@ app.post('/api/auth/sign-in', async (c) => {
     const { username, password } = await c.req.json()
     const cleanHandle = (username || '').replace(/^@/, '').trim().toLowerCase()
     const db = c.env?.DB
+    let matchedUser: any = null
 
     if (db) {
       try {
         await ensureD1Database(db)
         const user: any = await db.prepare("SELECT * FROM users WHERE handle = ? OR id = ?").bind(cleanHandle, cleanHandle).first()
         if (user && user.password_hash === password) {
-          const { password_hash, ...safe } = user
-          return c.json({ success: true, user: safe })
+          matchedUser = user
         }
       } catch (d1Err: any) {
         console.warn('[D1 Sign In Warning]', d1Err?.message)
       }
     }
 
-    const match = Array.from(memoryStore.users.values()).find((u) => u.handle.toLowerCase() === cleanHandle && u.password_hash === password)
-    if (match) {
-      const { password_hash, ...safe } = match
-      return c.json({ success: true, user: safe })
+    if (!matchedUser) {
+      const match = Array.from(memoryStore.users.values()).find((u) => u.handle.toLowerCase() === cleanHandle && u.password_hash === password)
+      if (match) matchedUser = match
+    }
+
+    if (matchedUser) {
+      const sessionToken = await createSession(matchedUser.id, db)
+      const { password_hash, ...safe } = matchedUser
+      return c.json({ success: true, token: sessionToken, user: safe })
     }
 
     return c.json({ error: 'Incorrect username or password' }, 401)
   } catch (err: any) {
     return c.json({ error: err.message || 'Sign in error' }, 500)
   }
+})
+
+app.post('/api/auth/sign-out', async (c) => {
+  const authHeader = c.req.header('Authorization') || ''
+  const token = authHeader.replace(/^Bearer\s+/i, '').trim()
+  if (token) {
+    memoryStore.sessions.delete(token)
+    if (c.env?.DB) {
+      try {
+        await c.env.DB.prepare('DELETE FROM sessions WHERE token = ?').bind(token).run()
+      } catch (e) {}
+    }
+  }
+  return c.json({ success: true })
 })
 
 // ============================================================================
@@ -371,7 +453,7 @@ app.get('/api/conversations', async (c) => {
             username: row.remote_handle || row.user_b,
             displayName: row.remote_handle ? `@${row.remote_handle}` : row.user_b,
           },
-          status: row.status, // 'active' | 'pending' | 'archived'
+          status: row.status,
           remoteInstanceUrl: row.remote_instance_url || null,
           lastMessage: row.last_message_snippet
             ? {
@@ -451,7 +533,6 @@ app.post('/api/federation/requests', async (c) => {
     const conversationId = 'conv_' + cleanRemoteHandle
     const now = Date.now()
 
-    // Resolve sender identity cleanly from request or D1
     let actualHandle = myHandle || ''
     let actualDisplayName = myDisplayName || ''
     const db = c.env?.DB
@@ -489,7 +570,7 @@ app.post('/api/federation/requests', async (c) => {
       remote_instance_url: normalizedUrl,
       last_message_snippet: `Friend request sent to @${cleanRemoteHandle}`,
       last_message_at: now,
-      status: 'pending', // Chat locked until approved
+      status: 'pending',
     }
 
     memoryStore.friendships.set(friendshipId, friendshipRecord)
@@ -523,7 +604,6 @@ app.post('/api/federation/requests', async (c) => {
       console.warn('[Sign Error]', e)
     }
 
-    // Await fetch so Cloudflare Workers edge runtime does not cancel it!
     let remoteSuccess = false
     try {
       const remoteRes = await fetch(`${normalizedUrl}/api/federation/v1/requests`, {
@@ -535,7 +615,6 @@ app.post('/api/federation/requests', async (c) => {
         body: payload,
       })
       remoteSuccess = remoteRes.ok
-      console.log('[Remote Peer Request Result]', remoteRes.status)
     } catch (remoteErr: any) {
       console.warn('[Remote Peer Request Offline/Failed]', remoteErr?.message)
     }
@@ -652,14 +731,12 @@ app.post('/api/federation/requests/accept', async (c) => {
     }
     actualMyHandle = actualMyHandle || 'me'
 
-    // Live unlock on local screen
     broadcastAllStreams('friend_accepted', {
       remoteHandle: cleanHandle,
       conversationId,
       status: 'active',
     })
 
-    // Forward acceptance to peer instance with AWAIT so Cloudflare Workers delivers it
     if (remoteInstanceUrl) {
       try {
         await fetch(`${normalizeUrl(remoteInstanceUrl)}/api/federation/v1/requests/accept`, {
@@ -838,11 +915,9 @@ app.post('/api/messaging', async (c) => {
       }
     }
 
-    // Emit live to sender's other tabs
     emitUserEvent(actualSender, 'new_message', messageRecord)
     broadcastAllStreams('new_message', messageRecord)
 
-    // Forward to peer instance if remote with AWAIT so Cloudflare Workers does not terminate it
     const targetUrl = remoteInstanceUrl || memoryStore.conversations.get(conversationId)?.remote_instance_url
     if (targetUrl) {
       let senderHandle = myHandle || ''
@@ -972,7 +1047,7 @@ app.get('/api/stream', (c) => {
         clearInterval(pingInterval)
         activeStreams.get(userId)?.delete(clientRecord)
       }
-    }, 8000)
+    }, 15000)
 
     stream.onAbort(() => {
       clearInterval(pingInterval)

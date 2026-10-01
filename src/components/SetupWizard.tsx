@@ -1,9 +1,9 @@
 import React, { useState } from 'react'
 import { MessageSquare, ShieldCheck, Sparkles, ArrowRight, User } from 'lucide-react'
 
-export function SetupWizard({ onComplete }: { onComplete: (displayName: string, handle: string) => void }) {
-  const [displayName, setDisplayName] = useState('Yogesh Singh')
-  const [adminUsername, setAdminUsername] = useState('yogesh')
+export function SetupWizard({ onComplete }: { onComplete: (displayName: string, handle: string, token?: string) => void }) {
+  const [displayName, setDisplayName] = useState('')
+  const [adminUsername, setAdminUsername] = useState('')
   const [password, setPassword] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
@@ -25,7 +25,7 @@ export function SetupWizard({ onComplete }: { onComplete: (displayName: string, 
       })
       const data = await res.json()
       if (res.ok && data.success) {
-        onComplete(displayName, data.user?.handle || adminUsername)
+        onComplete(displayName, data.user?.handle || adminUsername, data.token)
       } else {
         setError(data.error || 'Failed to complete setup')
       }
