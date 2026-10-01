@@ -1052,6 +1052,12 @@ export function MessagingApp({
                             >
                               <img
                                 src={getOptimizedImageUrl(parsed.imageUrl, 700)}
+                                onError={(e) => {
+                                  const target = e.currentTarget
+                                  if (parsed.imageUrl && target.src !== parsed.imageUrl) {
+                                    target.src = parsed.imageUrl
+                                  }
+                                }}
                                 alt={parsed.caption || 'Photo message'}
                                 loading="lazy"
                                 className="w-full h-auto max-h-[380px] object-cover rounded-xl transition-transform duration-200 group-hover:scale-[1.02]"
@@ -1463,6 +1469,12 @@ export function MessagingApp({
 
             <img
               src={getOptimizedImageUrl(lightboxUrl, 1600)}
+              onError={(e) => {
+                const target = e.currentTarget
+                if (lightboxUrl && target.src !== lightboxUrl) {
+                  target.src = lightboxUrl
+                }
+              }}
               alt="Full view"
               className="max-w-full max-h-[85vh] object-contain rounded-xl shadow-2xl"
             />
